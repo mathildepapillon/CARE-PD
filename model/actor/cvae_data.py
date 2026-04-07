@@ -1,10 +1,11 @@
 """
-Shared CARE-PD / H36M data helpers for Actor CVAE (no Lightning dependency).
+Shared CARE-PD data helpers for Actor CVAE (no Lightning dependency).
 
 Supported data modes
 --------------------
-``h36m`` (default / legacy)
-    XYZ joint positions from the H36M preprocessed pipeline.
+``carepd``
+    CARE-PD clinical H36M-style XYZ joint positions (17 joints × 3).
+    Loaded via ``dataset_factory`` using the project's standard fold splits.
     Batch shape: ``(B, T, 17, 3)`` → ACTOR dict ``x: (B, 17, 3, T)``.
 
 ``6dsmpl``
@@ -33,7 +34,6 @@ import os
 import torch
 from const import path
 from data.dataloaders import dataset_factory
-from data.datasets.h36m_actor_npz import H36MActorNPZDataset, load_train_val_indices
 
 _SUPPORTED = ["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait"]
 
@@ -202,24 +202,6 @@ def get_6dsmpl_datasets(args):
             "Pass --carepd_labels_pkl /path/to/{dataset}.pkl if it lives elsewhere."
         )
     return dataset_factory(p, "motionclip", args.fold)
-
-
-def get_h36m_npz_loaders(args):
-    if not args.h36m_npz_path or not os.path.isfile(args.h36m_npz_path):
-        raise FileNotFoundError(
-            f"h36m_npz_path not found: {args.h36m_npz_path}. "
-            "Generate a test file: python scripts/build_synthetic_h36m_actor_npz.py"
-        )
-    tr_idx, va_idx = load_train_val_indices(
-        args.h36m_npz_path, args.val_fraction, args.seed,
-    )
-    train_ds = H36MActorNPZDataset(
-        args.h36m_npz_path, tr_idx, center_root=args.center_root,
-    )
-    val_ds = H36MActorNPZDataset(
-        args.h36m_npz_path, va_idx, center_root=args.center_root,
-    )
-    return train_ds, val_ds
 
 
 def actor_batch_from_carepd(

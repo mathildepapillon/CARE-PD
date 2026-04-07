@@ -44,7 +44,7 @@ POSE_AND_LABEL = {
             'PATH_LABELS': f'{PROJECT_ROOT}/assets/datasets/BMCLab.pkl'
         },
         '6DSMPL': {
-            'PATH_POSES': f'{PROJECT_ROOT}/assets/datasets6D_SMPL//BMCLab/6D_SMPL_30f_or_longer.npz',
+            'PATH_POSES': f'{PROJECT_ROOT}/assets/datasets/6D_SMPL/BMCLab/6D_SMPL_30f_or_longer.npz',
             'PATH_LABELS': f'{PROJECT_ROOT}/assets/datasets/BMCLab.pkl'
         }
     },

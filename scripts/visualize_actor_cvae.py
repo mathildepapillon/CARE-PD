@@ -4,7 +4,7 @@ visualize_actor_cvae.py — Render ActorCVAE reconstructions as animated GIFs.
 
 Supports both data modes:
 
-``carepd`` / ``h36m_npz`` (legacy XYZ)
+``carepd``
     Stick figures drawn from the raw 17-joint H36M XYZ output.
 
 ``6dsmpl`` (ACTOR-parity)
@@ -50,7 +50,6 @@ from model.actor.cvae_data import (  # noqa: E402
     actor_batch_from_carepd,
     actor_batch_from_6dsmpl,
     get_carepd_datasets,
-    get_h36m_npz_loaders,
     get_6dsmpl_datasets,
 )
 from model.actor.cvae import ActorCVAE  # noqa: E402
@@ -71,7 +70,7 @@ H36M17_EDGES = {
     (8, 11), (11, 12), (12, 13), (8, 9), (9, 10),
 }
 
-# SMPL 24-joint edges for 6DSMPL mode (matches SMPL_BONES in inspect_6dsmpl_batch.py)
+    # SMPL 24-joint edges for 6DSMPL mode
 SMPL24_EDGES = [
     (0, 3), (3, 6), (6, 9), (9, 12), (12, 15),         # spine + neck
     (0, 1), (1, 4), (4, 7), (7, 10),                   # left leg
@@ -231,7 +230,7 @@ def save_actor_recon_gifs(
         fps:              GIF frame rate.
         output_filenames: Optional list of explicit filenames (length ≥ n_examples).
         verbose:          Print a line per saved file.
-        data_mode:        One of ``'carepd'``, ``'h36m_npz'``, ``'6dsmpl'``.
+        data_mode:        One of ``'carepd'``, ``'6dsmpl'``.
         labels:           Optional ``(B,)`` label tensor (used for ``y`` in 6dsmpl mode).
 
     Returns:
@@ -392,9 +391,7 @@ def main():
     batch_size = args.batch_size if args.batch_size is not None else cfg.get("batch_size", 16)
     data_mode  = cfg.get("data_mode", "carepd")
 
-    if data_mode == "h36m_npz":
-        train_ds, val_ds = get_h36m_npz_loaders(ns)
-    elif data_mode == "6dsmpl":
+    if data_mode == "6dsmpl":
         train_ds, val_ds = get_6dsmpl_datasets(ns)
     else:
         train_ds, val_ds = get_carepd_datasets(ns)

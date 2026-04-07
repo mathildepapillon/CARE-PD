@@ -32,7 +32,6 @@ from data.dataloaders import collate_fn  # noqa: E402
 from model.actor.cvae_data import (  # noqa: E402
     actor_batch_from_carepd,
     get_carepd_datasets,
-    get_h36m_npz_loaders,
 )
 from visualize_actor_cvae import (  # noqa: E402
     H36M17_EDGES,
@@ -189,10 +188,7 @@ def main():
 
     ns = types.SimpleNamespace(**cfg)
     bs = args.batch_size if args.batch_size is not None else cfg.get("batch_size", 16)
-    if cfg.get("data_mode", "carepd") == "h36m_npz":
-        _, val_ds = get_h36m_npz_loaders(ns)
-    else:
-        _, val_ds = get_carepd_datasets(ns)
+    _, val_ds = get_carepd_datasets(ns)
     loader = torch.utils.data.DataLoader(
         val_ds,
         batch_size=bs,

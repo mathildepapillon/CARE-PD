@@ -4,9 +4,8 @@ train_actor_cvae.py — ACTOR-aligned CVAE for motion sequences
 
 Data modes
 ----------
-``carepd``   (legacy)  CARE-PD clinical H36M-style folds (17 joints × 3 XYZ).
-``h36m_npz`` (legacy)  Single consolidated .npz of public H36M sequences.
-``6dsmpl``   (ACTOR-parity)  CARE-PD 6D_SMPL rotations (24 joints × 6D).
+``carepd``  CARE-PD clinical H36M-style folds (17 joints × 3 XYZ).
+``6dsmpl``  CARE-PD 6D_SMPL rotations — ACTOR-parity mode (24 joints × 6D).
 
 ACTOR parity (mode = ``6dsmpl``)
 ---------------------------------
@@ -23,11 +22,6 @@ This mode replicates the exact Mathux/ACTOR training objective:
 The SMPL FK is performed by ``model/actor/rotation2xyz.py`` using the
 SMPL neutral body model at
 ``data/preprocessing/common/body_models/smpl/SMPL_NEUTRAL.pkl``.
-
-Smoke-test (no licensed data)
-------------------------------
-    python scripts/build_synthetic_h36m_actor_npz.py --out artifacts/synth.npz
-    python train_actor_cvae.py --data_mode h36m_npz --h36m_npz_path artifacts/synth.npz
 
 Metrics (each epoch)
 ---------------------
@@ -62,7 +56,6 @@ from model.actor.cvae_data import (
     actor_batch_from_carepd,
     actor_batch_from_6dsmpl,
     get_carepd_datasets,
-    get_h36m_npz_loaders,
     get_6dsmpl_datasets,
 )
 from model.actor.transformer_arch import Decoder_TRANSFORMER, Encoder_TRANSFORMER
@@ -109,9 +102,8 @@ class ActorCVAEModule(pl.LightningModule):
     Args:
         model:        Constructed ``ActorCVAE`` instance.
         lr:           AdamW learning rate.
-        data_mode:    One of ``"carepd"``, ``"h36m_npz"``, ``"6dsmpl"``.
-                      Controls how the raw dataloader batch is converted to an
-                      ACTOR batch dict before the model forward.
+        data_mode:    ``"carepd"`` or ``"6dsmpl"``.  Controls how the raw
+                      dataloader batch is converted to an ACTOR batch dict.
         lr_scheduler: ``"none"`` (ACTOR default) or ``"step"``.
     """
 
@@ -139,12 +131,7 @@ class ActorCVAEModule(pl.LightningModule):
         lab: torch.Tensor,
         pad_mask: torch.Tensor,
     ) -> dict:
-        """Convert a raw dataloader batch to the ACTOR batch dict format.
-
-        For ``6dsmpl`` mode the class label ``y`` is taken from the dataloader
-        (UPDRS severity score mapped to an integer class index).  For legacy
-        modes ``y`` is set to zero because the H36M data has no class label.
-        """
+        """Convert a raw dataloader batch to the ACTOR batch dict format."""
         device = x.device
         pad_mask = pad_mask.bool()
         if self.data_mode == "6dsmpl":
@@ -320,30 +307,13 @@ def parse_args():
                    help="CUDA_VISIBLE_DEVICES string (e.g. '0,1').")
     p.add_argument(
         "--data_mode", type=str, default="carepd",
-        choices=("carepd", "h36m_npz", "6dsmpl"),
+        choices=("carepd", "6dsmpl"),
         help=(
-            "carepd:    CARE-PD H36M-style clinical folds (17×3 XYZ). "
-            "h36m_npz:  Single consolidated .npz of H36M sequences. "
-            "6dsmpl:    CARE-PD 6D_SMPL rotations — ACTOR-parity mode "
+            "carepd:  CARE-PD H36M-style clinical folds (17×3 XYZ). "
+            "6dsmpl:  CARE-PD 6D_SMPL rotations — ACTOR-parity mode "
             "(24 joints × 6D, rc+rcxyz+kl loss with SMPL FK)."
         ),
     )
-    p.add_argument(
-        "--h36m_npz_path", type=str, default=None,
-        help="Required for data_mode=h36m_npz — consolidated N×T×17×3 poses.",
-    )
-    p.add_argument("--val_fraction", type=float, default=0.05,
-                   help="Fraction of sequences reserved for validation (h36m_npz only).")
-    cr = p.add_mutually_exclusive_group()
-    cr.add_argument(
-        "--center_root", dest="center_root", action="store_true",
-        help="Subtract joint-0 each frame (default, h36m_npz mode only).",
-    )
-    cr.add_argument(
-        "--no_center_root", dest="center_root", action="store_false",
-        help="Keep absolute coordinates (h36m_npz mode only).",
-    )
-    p.set_defaults(center_root=True)
     p.add_argument("--dataset", type=str, default="BMCLab",
                    choices=["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait"],
                    help="CARE-PD dataset name (carepd / 6dsmpl modes).")
@@ -414,15 +384,15 @@ def parse_args():
     p.add_argument(
         "--lambda_rr", type=float, default=None,
         help=(
-            "Root-relative MSE.  Default: 0.0 for 6dsmpl (rcxyz already covers "
-            "articulation); 1.0 for carepd/h36m_npz XYZ modes."
+            "Root-relative MSE.  Default: 0.0 for both modes "
+            "(rcxyz covers articulation in 6dsmpl; vel covers it in carepd)."
         ),
     )
     p.add_argument(
         "--lambda_vel", type=float, default=None,
         help=(
             "Frame-delta MSE on raw representation.  Default: 1.0 for 6dsmpl; "
-            "0.2 for carepd/h36m_npz XYZ modes."
+            "5.0 for carepd."
         ),
     )
     p.add_argument(
@@ -485,7 +455,7 @@ def _resolve_mode_defaults(args):
         if not hasattr(args, "lambda_velxyz") or args.lambda_velxyz is None:
             args.lambda_velxyz = 10.0
     else:
-        # Legacy XYZ modes: 17 joints × 3 XYZ
+        # carepd mode: 17 joints × 3 XYZ
         if args.njoints is None:
             args.njoints = 17
         if args.nfeats is None:
@@ -508,10 +478,7 @@ def main():
     set_random_seed(args.seed)
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
-    if args.data_mode == "h36m_npz":
-        tag_ds = os.path.splitext(os.path.basename(args.h36m_npz_path or "npz"))[0]
-    else:
-        tag_ds = f"{args.dataset}_fold{args.fold}"
+    tag_ds = f"{args.dataset}_fold{args.fold}"
     run_tag = f"actor_{args.data_mode}_{tag_ds}_{datetime.datetime.now():%Y%m%d_%H%M%S}"
     ckpt_dir = os.path.join(args.checkpoint_dir, run_tag)
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -572,9 +539,7 @@ def main():
     ).to(device)
 
     # ---- Load datasets ---------------------------------------------------
-    if args.data_mode == "h36m_npz":
-        train_ds, val_ds = get_h36m_npz_loaders(args)
-    elif args.data_mode == "6dsmpl":
+    if args.data_mode == "6dsmpl":
         train_ds, val_ds = get_6dsmpl_datasets(args)
     else:
         train_ds, val_ds = get_carepd_datasets(args)
