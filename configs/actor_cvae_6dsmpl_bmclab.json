@@ -1,0 +1,41 @@
+{
+    "_comment": "ACTOR-parity config: 6D_SMPL rotations + SMPL FK (rc + rcxyz + kl). Matches Mathux/ACTOR train_cvae defaults.",
+
+    "data_mode": "6dsmpl",
+    "dataset": "BMCLab",
+    "num_folds": 6,
+    "fold": 1,
+    "seed": 0,
+    "batch_size": 32,
+    "epochs": 200,
+
+    "_architecture": "Transformer encoder + decoder, 8 layers — same as ACTOR README example.",
+    "latent_dim": 256,
+    "ff_size": 1024,
+    "num_layers": 8,
+    "num_heads": 4,
+    "dropout": 0.1,
+    "num_classes": 3,
+
+    "_joints": "24 SMPL joints × 6D rotations (joints 0-23 from 6D_SMPL NPZ; joint 24 zeros dropped).",
+    "njoints": 24,
+    "nfeats": 6,
+    "pose_rep": "rot6d",
+
+    "_losses": "rcxyz (position in FK space) + velxyz (temporal structure in FK space) + kl. lambda_rc=0 because the direct 6D MSE loss has a very strong local minimum at the mean gait pose that dominates gradients and causes one-epoch collapse. All learning goes through the FK, which does not have this mean-pose attractor.",
+    "lambda_rc": 0.0,
+    "lambda_rcxyz": 1.0,
+    "lambda_kl": 1e-05,
+    "lambda_rr": 0.0,
+    "lambda_vel": 0.0,
+    "lambda_velxyz": 10.0,
+
+    "_optimiser": "AdamW lr=1e-4, wd=1e-4, no scheduler — same as ACTOR.",
+    "lr": 0.0001,
+    "lr_scheduler": "none",
+
+    "checkpoint_dir": "./experiment_outs/actor_cvae",
+    "experiment_name": "ActorCVAE_6DSMPL",
+    "wandb_project": "carepd_recon",
+    "recon_gif_every_n_epochs": 50
+}

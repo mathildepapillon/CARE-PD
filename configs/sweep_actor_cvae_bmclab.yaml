@@ -1,0 +1,53 @@
+program: train_actor_cvae.py
+method: bayes
+metric:
+  name: val/mpjpe
+  goal: minimize
+
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 5.0e-5
+    max: 1.0e-3
+
+  lambda_vel:
+    # Balance between position accuracy (rc) and temporal motion (vel).
+    # Current best: 5.0. Wider range to explore.
+    distribution: log_uniform_values
+    min: 1.0
+    max: 50.0
+
+  lambda_rc:
+    # Direct XYZ MSE weight. Keep near 1 but allow some tuning.
+    distribution: uniform
+    min: 0.2
+    max: 3.0
+
+  lambda_kl:
+    # KL weight. Too high → posterior collapse. Too low → poor generation.
+    # For reconstruction, very small values work best.
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 1.0e-4
+
+  dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.25
+
+command:
+  - ${env}
+  - carepd/bin/python
+  - ${program}
+  - --config
+  - configs/actor_cvae_bmclab.json
+  # Do NOT pass --devices here.  Set CUDA_VISIBLE_DEVICES externally before
+  # calling `wandb agent` so each agent can target a different GPU set.
+  # The training script calls torch.cuda.device_count() to pick up however
+  # many GPUs are visible, and Lightning uses all of them with DDP.
+  - --epochs
+  - "100"
+  - --recon_gif_every_n_epochs
+  - "999"
+  # Sweep-controlled parameters injected here
+  - ${args}
