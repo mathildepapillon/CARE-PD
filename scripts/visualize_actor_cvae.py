@@ -27,23 +27,20 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import sys
 from typing import Optional
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from matplotlib.lines import Line2D
-from PIL import Image as PILImage
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _REPO)
+sys.path.insert(0, _SCRIPTS)
+
+import viz_utils  # noqa: E402
 
 from data.dataloaders import collate_fn  # noqa: E402
 from model.actor.cvae_data import (  # noqa: E402
@@ -57,65 +54,6 @@ from model.actor.transformer_arch import (  # noqa: E402
     Decoder_TRANSFORMER,
     Encoder_TRANSFORMER,
 )
-
-
-# ---------------------------------------------------------------------------
-# Skeleton edge definitions
-# ---------------------------------------------------------------------------
-
-# H36M 17-joint edges for legacy XYZ mode
-H36M17_EDGES = {
-    (0, 4), (0, 1), (4, 5), (5, 6), (1, 2), (2, 3),
-    (0, 7), (7, 8), (8, 14), (14, 15), (15, 16),
-    (8, 11), (11, 12), (12, 13), (8, 9), (9, 10),
-}
-
-    # SMPL 24-joint edges for 6DSMPL mode
-SMPL24_EDGES = [
-    (0, 3), (3, 6), (6, 9), (9, 12), (12, 15),         # spine + neck
-    (0, 1), (1, 4), (4, 7), (7, 10),                   # left leg
-    (0, 2), (2, 5), (5, 8), (8, 11),                   # right leg
-    (9, 13), (13, 16), (16, 18), (18, 20), (20, 22),   # left arm
-    (9, 14), (14, 17), (17, 19), (19, 21), (21, 23),   # right arm
-]
-
-
-# ---------------------------------------------------------------------------
-# Drawing helpers
-# ---------------------------------------------------------------------------
-
-def _to_display_xyz(pos: np.ndarray) -> np.ndarray:
-    """Map dataset axes to matplotlib Z-up: (x, y, z) → (x, z, y)."""
-    return pos[..., [0, 2, 1]]
-
-
-def _axis_limits(pos: np.ndarray) -> dict:
-    """pos: (N, J, 3) after display remap."""
-    flat = pos.reshape(-1, 3)
-    margin = 0.08 * (np.ptp(flat, axis=0).max() + 1e-6)
-    lo = flat.min(axis=0) - margin
-    hi = flat.max(axis=0) + margin
-    return {"x": (lo[0], hi[0]), "y": (lo[1], hi[1]), "z": (lo[2], hi[2])}
-
-
-def _draw_skeleton(ax, joints: np.ndarray, edges, *, color: str, alpha: float = 0.9) -> None:
-    """Draw a single-frame stick figure.
-
-    Args:
-        ax:     Matplotlib 3D axes.
-        joints: ``(J, 3)`` positions in display coordinates.
-        edges:  Iterable of ``(i, j)`` joint index pairs.
-        color:  Line and scatter colour.
-        alpha:  Transparency.
-    """
-    for a, b in edges:
-        ax.plot(
-            [joints[a, 0], joints[b, 0]],
-            [joints[a, 1], joints[b, 1]],
-            [joints[a, 2], joints[b, 2]],
-            color=color, linewidth=2.0, alpha=alpha,
-        )
-    ax.scatter(joints[:, 0], joints[:, 1], joints[:, 2], c=color, s=12, alpha=alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -264,9 +202,8 @@ def save_actor_recon_gifs(
     out_btj3 = out_bjft.permute(0, 3, 1, 2).cpu().numpy()
     m_np     = mask_bt.cpu().numpy()
 
-    # Choose skeleton edges based on joint count
     n_joints = gt_btj3.shape[2]
-    edges = SMPL24_EDGES if n_joints == 24 else H36M17_EDGES
+    edges = viz_utils.edges_for_njoints(n_joints)
 
     n_examples = min(n_examples, gt_btj3.shape[0])
     if output_filenames is not None and len(output_filenames) < n_examples:
@@ -274,62 +211,29 @@ def save_actor_recon_gifs(
             f"output_filenames ({len(output_filenames)}) < n_examples ({n_examples})"
         )
 
-    legend_elems = [
-        Line2D([0], [0], color="steelblue", linewidth=2, label="GT"),
-        Line2D([0], [0], color="darkorange", linewidth=2, label="recon"),
-    ]
     saved = []
 
     for b in range(n_examples):
         real_len = int(m_np[b].sum())
         if real_len < 2:
             continue
-        gt  = gt_btj3[b,  :real_len]   # (T, J, 3)
-        hr  = out_btj3[b, :real_len]
-
-        gt_d  = _to_display_xyz(gt)
-        hr_d  = _to_display_xyz(hr)
-        lims  = _axis_limits(np.concatenate([gt_d, hr_d], axis=0))
-
-        frames = []
-        for fi in range(real_len):
-            fig, ax = plt.subplots(1, 1, figsize=(4, 5), subplot_kw={"projection": "3d"})
-            _draw_skeleton(ax, gt_d[fi],  edges, color="steelblue",  alpha=0.9)
-            _draw_skeleton(ax, hr_d[fi],  edges, color="darkorange", alpha=0.85)
-            ax.set_xlim(*lims["x"])
-            ax.set_ylim(*lims["y"])
-            ax.set_zlim(*lims["z"])
-            ax.view_init(elev=15, azim=-75)
-            ax.set_xlabel("x")
-            ax.set_ylabel("z (disp)")
-            ax.set_zlabel("y (disp)")
-            ax.legend(handles=legend_elems, fontsize=7, loc="upper right", framealpha=0.6)
-            ax.set_title(
-                f"batch {batch_idx:02d} seq {b}  frame {fi + 1}/{real_len}",
-                fontsize=8,
-            )
-            plt.tight_layout()
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-            plt.close(fig)
-            buf.seek(0)
-            frames.append(PILImage.open(buf).copy())
-            buf.close()
+        gt = gt_btj3[b, :real_len]
+        hr = out_btj3[b, :real_len]
 
         if output_filenames is not None:
             out_path = os.path.join(out_dir, output_filenames[b])
         else:
             out_path = os.path.join(out_dir, f"actor_sample_{batch_idx:02d}_{b:02d}.gif")
-        frames[0].save(
+        viz_utils.save_motion_comparison_gif(
+            gt,
+            hr,
+            edges,
             out_path,
-            save_all=True,
-            append_images=frames[1:],
-            loop=0,
-            duration=max(1, int(1000 / fps)),
+            fps,
+            title_prefix=f"batch {batch_idx:02d} seq {b}",
+            verbose=verbose,
         )
-        saved.append(out_path)
-        if verbose:
-            print(f"  saved {out_path} ({real_len} frames @ {fps} fps)")
+        saved.append(os.path.abspath(out_path))
 
     return saved
 

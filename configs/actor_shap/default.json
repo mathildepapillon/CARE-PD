@@ -1,0 +1,36 @@
+{
+  "_comment": "ActorSHAP default config. Architecture dims must match the ActorCVAE checkpoint.",
+
+  "dataset":           "BMCLab",
+  "data_mode":         "carepd",
+  "num_folds":         6,
+  "fold":              1,
+  "seed":              0,
+  "batch_size":        32,
+
+  "_comment_arch": "Must match the ActorCVAE checkpoint architecture.",
+  "latent_dim":        256,
+  "ff_size":           1024,
+  "num_layers":        8,
+  "num_heads":         4,
+  "dropout":           0.1,
+  "num_classes":       3,
+
+  "_comment_training": "Phase 1 runs with --phase 1 --epochs 30. Phase 2 uses the phase1 ckpt.",
+  "phase":             2,
+  "epochs":            150,
+  "lr":                1e-4,
+  "lr_decoder":        1e-5,
+  "lambda_kl":         1.0,
+  "kl_warmup_epochs":  20,
+  "mask_axis":         "spatial",
+
+  "_comment_paths": "Fill in the actual ActorCVAE checkpoint path before running.",
+  "actor_cvae_ckpt":   "./experiment_outs/actor_cvae/<run>/checkpoints/last.ckpt",
+  "phase1_ckpt":       null,
+  "checkpoint_dir":    "./experiment_outs/actor_shap",
+  "experiment_name":   "ActorSHAP",
+  "wandb_project":     "carepd_shap",
+  "wandb_entity":      null,
+  "wandb_run_name":    null
+}

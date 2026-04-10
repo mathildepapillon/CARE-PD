@@ -67,25 +67,29 @@ def assert_learning_params(params):
         assert learning_param in params, f'"{learning_param}" is not set in params.'
 
 def compute_class_weights(data_loader, params):
-    class_counts = Counter()
-    total_samples = 0
-    num_classes = 0
+    # Read labels directly from the underlying dataset to avoid a full dataloader
+    # iteration (which triggers expensive per-sample preprocessing for every clip).
+    dataset = data_loader.dataset
+    if hasattr(dataset, 'labels'):
+        all_labels = dataset.labels
+    else:
+        # Fallback: iterate the dataloader (slow but correct for unknown dataset types)
+        all_labels = []
+        for _, targets, _, _, _ in data_loader:
+            all_labels.extend(targets.tolist())
 
-    for _, targets, _, _, _ in data_loader:
-        class_counts.update(targets.tolist())
-        total_samples += len(targets)
+    class_counts = Counter(all_labels)
+    total_samples = len(all_labels)
+    num_classes = params['num_classes']
 
     class_weights = []
-
-    num_classes = params['num_classes']
     for i in range(num_classes):
         count = class_counts[i]
         weight = 0.0 if count == 0 else total_samples / (num_classes * count)
         class_weights.append(weight)
-        
-        total_weights = sum(class_weights)
-        normalized_class_weights = [weight / total_weights for weight in class_weights]
 
+    total_weights = sum(class_weights)
+    normalized_class_weights = [w / total_weights for w in class_weights]
     return normalized_class_weights
 
 def log_cfm_to_wandb(confusion, fold, num_classes, kind='val'):

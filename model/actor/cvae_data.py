@@ -18,8 +18,8 @@ Supported data modes
       was intended for translation but is unused.  We drop it.
 
     After dropping joint 24 the working shape is ``(T, 24, 6)``.  The
-    dataloader returns ``(B, 60, 25, 6)``; we strip the last joint before
-    building the ACTOR batch dict.
+    dataloader returns ``(B, source_seq_len, 25, 6)``; we strip the last
+    joint before building the ACTOR batch dict.
 
     ACTOR batch dict: ``x: (B, 24, 6, T)``.
 
@@ -47,6 +47,7 @@ def build_motionclip_params(
     batch_size,
     experiment_name,
     *,
+    source_seq_len: int = 81,
     pose_npz: str | None = None,
     labels_pkl: str | None = None,
 ):
@@ -59,7 +60,7 @@ def build_motionclip_params(
         "data_type": "h36m",
         "experiment_name": experiment_name,
         "in_data_dim": 3,
-        "source_seq_len": 60,
+        "source_seq_len": source_seq_len,
         "num_folds": num_folds,
         "data_centered": False,
         "merge_last_dim": False,
@@ -93,6 +94,7 @@ def build_6dsmpl_params(
     batch_size: int,
     experiment_name: str,
     *,
+    source_seq_len: int = 81,
     pose_npz: str | None = None,
     labels_pkl: str | None = None,
 ) -> dict:
@@ -112,7 +114,7 @@ def build_6dsmpl_params(
         "data_type": "6DSMPL",
         "experiment_name": experiment_name,
         "in_data_dim": 6,
-        "source_seq_len": 60,
+        "source_seq_len": source_seq_len,
         "num_folds": num_folds,
         "data_centered": False,
         "merge_last_dim": False,
@@ -150,6 +152,7 @@ def get_carepd_datasets(args):
         args.num_folds,
         args.batch_size,
         args.experiment_name,
+        source_seq_len=getattr(args, "source_seq_len", 81),
         pose_npz=getattr(args, "carepd_pose_npz", None),
         labels_pkl=getattr(args, "carepd_labels_pkl", None),
     )
@@ -173,8 +176,8 @@ def get_6dsmpl_datasets(args):
     """Load CARE-PD 6D_SMPL fold datasets for the given args namespace.
 
     Returns ``(train_dataset, val_dataset)`` via ``dataset_factory``.  The
-    returned batches have shape ``(B, 60, 25, 6)``; the caller is responsible
-    for dropping the trailing zero-padding joint (index 24) via
+    returned batches have shape ``(B, source_seq_len, 25, 6)``; the caller is
+    responsible for dropping the trailing zero-padding joint (index 24) via
     ``actor_batch_from_6dsmpl``.
     """
     if args.dataset == "all":
@@ -185,6 +188,7 @@ def get_6dsmpl_datasets(args):
         args.num_folds,
         args.batch_size,
         args.experiment_name,
+        source_seq_len=getattr(args, "source_seq_len", 81),
         pose_npz=getattr(args, "carepd_pose_npz", None),
         labels_pkl=getattr(args, "carepd_labels_pkl", None),
     )

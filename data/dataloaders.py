@@ -941,15 +941,7 @@ def dataloader_factory(params, train_dataset, eval_dataset, eval_batch_size='def
         pin_memory=True,
     )
 
-    train_dataset_for_class_weights_fn = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=params['batch_size'],
-        shuffle=True,
-        collate_fn=collate_fn,
-        pin_memory=True,
-    )
-    
-    class_weights = compute_class_weights(train_dataset_for_class_weights_fn, params)
+    class_weights = compute_class_weights(train_dataset_fn, params)
     return train_dataset_fn, eval_dataset_fn, class_weights
 
 class PreserveKeysTransform:

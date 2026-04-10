@@ -328,6 +328,10 @@ def parse_args():
     p.add_argument("--num_folds", type=int, default=6)
     p.add_argument("--fold", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--source_seq_len", type=int, default=81,
+                   help="Clip length in frames fed to the model. Must match the "
+                        "target classifier's source_seq_len (81 for PoseFormerV2 / "
+                        "MixSTE / MotionAGFormer, 80 for POTR, 90 for MotionBERT).")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-4,

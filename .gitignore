@@ -19,3 +19,10 @@ model/gaitvae/*
 configs/gaitvae/*
 scripts/visualize_gaitvae.py
 train_gaitvae.py
+
+artifacts/shap_gifs/*
+artifacts/viz_best/*
+
+logs/*
+results/*
+docs/metrics_and_baselines*

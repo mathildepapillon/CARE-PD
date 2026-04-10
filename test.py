@@ -54,7 +54,7 @@ def log_results(rep, rep012, confusion, rep_name, rep012_name, conf_name, out_p)
     artifact.add_file(os.path.join(out_p, rep012_name))
     wandb.log_artifact(artifact)
 
-def test__hypertune(params, best_params, new_params, splits, backbone_name, clarification_str, model_checkpoint_clarification_str, exp_path, device): 
+def test__hypertune(params, best_params, new_params, splits, backbone_name, clarification_str, model_checkpoint_clarification_str, exp_path, device, use_cached_features: bool = False): 
     out_path = os.path.join(exp_path, clarification_str)
     params['clarification'] = clarification_str
     params['model_checkpoint_clarification_str'] = model_checkpoint_clarification_str
@@ -68,17 +68,23 @@ def test__hypertune(params, best_params, new_params, splits, backbone_name, clar
         f"view:{''.join(params['views'])}",
         clarification_str
     ]
+    print("[DEBUG] Calling wandb.init()...")
     wandb.init(project='Final_MotionEval_test',
             group=f"{params['experiment_name']}_test",
             job_type=f"test_crossdataset{bool(params['cross_dataset_test'])}",
             name=f"{backbone_name}_{clarification_str}_{''.join(params['views'])}",
             tags=tags,
             settings=wandb.Settings(start_method='fork'))
+    print("[DEBUG] wandb.init() done. Updating config with params...")
     wandb.config.update(params)
+    print("[DEBUG] params config done. Collecting installed packages (can be slow)...")
     installed_packages = {d.project_name: d.version for d in pkg_resources.working_set}
+    print(f"[DEBUG] Collected {len(installed_packages)} packages. Uploading to wandb...")
     wandb.config.update({'installed_packages': installed_packages})
+    print("[DEBUG] installed_packages done.")
     wandb.config.update({'new_params': new_params})
     wandb.config.update({'best_params': best_params})
+    print("[DEBUG] wandb config fully updated. Starting training loop...")
     
     total_outs_last, total_gts, total_logits, total_states, total_video_names = [], [], [], [], []
     for fold, (train_dataset_fn, test_dataset_fn, class_weights) in enumerate(splits, start=1):
@@ -102,11 +108,17 @@ def test__hypertune(params, best_params, new_params, splits, backbone_name, clar
 
         start_time = datetime.datetime.now()
 
+        print(f"[DEBUG] Fold {fold}: loading pretrained backbone ({backbone_name})...")
         model_backbone = load_pretrained_backbone(params, backbone_name)
+        print(f"[DEBUG] Fold {fold}: backbone loaded. Building MotionEncoder...")
         model = MotionEncoder(backbone=model_backbone,
                                 params=params,
                                 num_classes=params['num_classes'],
                                 train_mode=params['train_mode'])
+        # When using pre-computed features the backbone forward pass is skipped.
+        model.use_cached_features = use_cached_features
+        if use_cached_features:
+            print(f"[INFO] Fold {fold}: using cached backbone features – backbone will NOT run during training.")
         model = model.to(device)
         if fold == 1:
             model_params = count_parameters(model)

@@ -74,7 +74,7 @@ def generate_config(param, f_name):
     params = {**param, **data_params, **model_params, **learning_params}
 
     if not param['combine_views_preds']:
-        f = open("./configs/potr/" + f_name, "rb")
+        f = open("configs/potr/" + f_name, "rb")
         params['model_prefix'] = params['model_prefix'] + f_name.split('.json')[0].replace('knn/', '')
     else:
         f = open(f_name, "rb")
