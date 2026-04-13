@@ -9,18 +9,26 @@ Each saved .npz contains per-clip pooled backbone features (post-backbone
 projection, *pre*-FC layers), so classifier training only needs to run the
 tiny classifier head on each batch (~1 ms/epoch instead of ~500 s/epoch).
 
-Usage (BMCLab, 6-fold, POTR backbone, GPU 4):
+Usage (BMCLab, LOSO, MotionBERT backbone, GPU 4):
 
-    python cache_backbone_features.py \
-        --backbone potr \
-        --config train_BMCLab_test_BMCLab_6fold.json \
-        --num_folds 6 \
+    python cache_backbone_features.py \\
+        --backbone motionbert \\
+        --config BMCLab.json \\
+        --num_folds -1 \\
         --device cuda:4
 
 Output files are written to:
-    assets/cached_features/<backbone>/<experiment_name>/<dataset>_<num_folds>fold/
+    assets/cached_features/<backbone>/<experiment_name>/<dataset>[_<views>]_<num_folds>fold/
         fold<N>_train.npz
         fold<N>_eval.npz
+
+For view-specific backbones (motionbert, mixste, motionagformer, poseformerv2)
+the view string is included in the directory name to avoid collisions between
+backright and sideright caches, e.g.:
+    motionbert/Hypertune/BMCLab_backright_23fold/
+
+Single-view backbones (potr, motionclip, momask) have no view suffix:
+    potr/Hypertune/BMCLab_23fold/
 
 Each .npz has keys:
     features   float32  (N, feature_dim)  — pooled backbone output per clip
@@ -30,8 +38,11 @@ Each .npz has keys:
     pad_masks  float32  (N, T)
 """
 
+from __future__ import annotations
+
 import argparse
 import importlib
+import json as _json
 import os
 import sys
 
@@ -62,7 +73,42 @@ _BACKBONE_CONFIG_MODULE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Path helpers (shared by run.py via import)
+# ---------------------------------------------------------------------------
+
+def _views_tag(params: dict) -> str:
+    """Return a hyphen-joined view tag, or '' for backbones without views."""
+    views = params.get('views') or []
+    return '-'.join(sorted(views)) if views else ''
+
+
+def make_cache_dir(out_root: str, backbone_name: str, params: dict) -> str:
+    """Canonical cache directory path for a given backbone + params config.
+
+    Mirrors _cached_features_dir in run.py — both functions must stay in sync.
+    The view tag is included for view-specific backbones to avoid cache
+    collisions between backright and sideright configs.
+    """
+    views = _views_tag(params)
+    folder = (
+        f"{params['dataset']}_{views}_{params['num_folds']}fold"
+        if views else
+        f"{params['dataset']}_{params['num_folds']}fold"
+    )
+    return os.path.join(out_root, backbone_name, params['experiment_name'], folder)
+
+
+# ---------------------------------------------------------------------------
+# Params loader
+# ---------------------------------------------------------------------------
+
 def _load_params(backbone: str, config_file: str, num_folds: int) -> dict:
+    """Load and resolve params for the given backbone + config.
+
+    num_folds=-1 is resolved to NUM_OF_PATIENTS_PER_DATASET[dataset], matching
+    the same logic run.py applies at the start of its config loop.
+    """
     if backbone not in _BACKBONE_CONFIG_MODULE:
         raise ValueError(f"Unsupported backbone '{backbone}'. "
                          f"Supported: {list(_BACKBONE_CONFIG_MODULE)}")
@@ -93,18 +139,25 @@ def _load_params(backbone: str, config_file: str, num_folds: int) -> dict:
         'tuned_model_config': None,
     }
     params, _ = mod.generate_config(param_seed, config_file)
+
+    # Resolve LOSO fold count (-1 → patient count), same as run.py line 472.
+    if num_folds == -1:
+        num_folds = const.NUM_OF_PATIENTS_PER_DATASET[params['dataset']]
     params['num_folds']   = num_folds
     params['num_classes'] = const.NUM_CLASSES_PER_DATASET[params['dataset']]
     params['LODO']        = False
 
-    # `ClassifierHead.__init__` expects these keys.  The normal run.py path
-    # injects them from the Optuna best-params JSON; we set safe defaults here
-    # because the FC layers are instantiated but never called during caching.
+    # ClassifierHead.__init__ expects these keys; set safe defaults since FC
+    # layers are instantiated but never called during caching.
     params.setdefault('classifier_hidden_dims', [])
     params.setdefault('classifier_dropout', 0.0)
 
     return params
 
+
+# ---------------------------------------------------------------------------
+# Feature extraction
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def _extract_features(model: MotionEncoder,
@@ -142,92 +195,131 @@ def _extract_features(model: MotionEncoder,
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--backbone',   required=True,
-                        help='Backbone name, e.g. potr')
-    parser.add_argument('--config',     required=True,
-                        help='Config JSON filename, e.g. train_BMCLab_test_BMCLab_6fold.json')
-    parser.add_argument('--num_folds',  type=int, default=6)
-    parser.add_argument('--device',     default='cuda:0')
-    parser.add_argument('--batch_size', type=int, default=256,
-                        help='Batch size for feature extraction (no grad, so large is fine)')
-    parser.add_argument('--out_root',   default='assets/cached_features',
-                        help='Root directory for cached .npz files')
-    parser.add_argument('--num_workers', type=int, default=4)
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"[INFO] Using device: {device}")
+def cache_all_folds(
+    params: dict,
+    backbone_name: str,
+    folds,
+    device: torch.device,
+    batch_size: int = 256,
+    num_workers: int = 4,
+    out_root: str = 'assets/cached_features',
+) -> None:
+    """Extract and save frozen backbone features for every fold split.
 
-    params = _load_params(args.backbone, args.config, args.num_folds)
+    This is the callable entry-point used both by the CLI (main()) and by
+    run.py's auto-cache logic in _build_splits_with_cache().
 
-    out_dir = os.path.join(
-        args.out_root,
-        args.backbone,
-        params['experiment_name'],
-        f"{params['dataset']}_{args.num_folds}fold",
-    )
+    Args:
+        params:        Config dict as returned by _load_params (or run.py's
+                       generate_config).  Must have 'num_folds' already
+                       resolved to a positive integer (not -1).
+        backbone_name: Backbone identifier, e.g. 'motionbert'.
+        folds:         Iterable of fold indices to cache (1-based).
+        device:        Torch device for the frozen backbone forward pass.
+        batch_size:    Batch size for feature extraction (no grad, so large
+                       values like 256 are safe).
+        num_workers:   DataLoader worker count.
+        out_root:      Root directory for cached .npz files.
+    """
+    out_dir = make_cache_dir(out_root, backbone_name, params)
     os.makedirs(out_dir, exist_ok=True)
-    print(f"[INFO] Features will be cached to: {out_dir}")
+    print(f"[cache] Features will be written to: {out_dir}")
 
-    # Build model once (backbone is frozen)
-    print(f"[INFO] Loading {args.backbone} backbone ...")
-    backbone = load_pretrained_backbone(params, args.backbone)
+    print(f"[cache] Loading {backbone_name} backbone ...")
+    backbone = load_pretrained_backbone(params, backbone_name)
     model    = MotionEncoder(backbone=backbone, params=params,
                              num_classes=params['num_classes'],
                              train_mode='classifier_only')
     model    = model.to(device)
     model.eval()
 
-    for fold in range(1, args.num_folds + 1):
-        # video_names sidecar: one JSON per fold (same for train and eval because
-        # video_name_to_index covers all videos in the fold, not just one split).
+    num_folds = params['num_folds']
+    for fold in folds:
         names_path = os.path.join(out_dir, f"fold{fold}_video_names.json")
 
         for split in ('train', 'eval'):
-            out_path = os.path.join(out_dir, f"fold{fold}_{split}.npz")
+            out_path     = os.path.join(out_dir, f"fold{fold}_{split}.npz")
             npz_exists   = os.path.exists(out_path)
             names_exists = os.path.exists(names_path)
 
             if npz_exists and names_exists:
-                print(f"[SKIP] {out_path} + video_names already exist.")
+                print(f"[cache][SKIP] {out_path} already exists.")
                 continue
 
-            print(f"[INFO] Fold {fold}/{args.num_folds}  split={split} ...")
-            train_ds, eval_ds = dataset_factory(params, args.backbone, fold)
+            print(f"[cache] Fold {fold}/{num_folds}  split={split} ...")
+            train_ds, eval_ds = dataset_factory(params, backbone_name, fold)
             ds = train_ds if split == 'train' else eval_ds
 
-            # --- Save video_names sidecar (once per fold, both splits share it) ---
-            # train.py accesses dataset.video_names[video_idx] where video_idx is
-            # the value from video_name_to_index — which is a CLIP index (the last
-            # clip position for each unique video name).  So we save the full
-            # per-clip names list so that names[clip_idx] returns the right name.
+            # Save per-clip video names sidecar (once per fold).
             if not names_exists and hasattr(ds, 'video_names'):
-                import json as _json
                 with open(names_path, 'w') as f:
                     _json.dump(list(ds.video_names), f)
-                print(f"  → {len(ds.video_names)} per-clip video names saved to {names_path}")
+                print(f"  -> {len(ds.video_names)} video names saved to {names_path}")
 
             if npz_exists:
-                print(f"[SKIP] {out_path} already exists – skipping feature extraction.")
+                print(f"[cache][SKIP] {out_path} already exists – skipping extraction.")
                 continue
 
             loader = DataLoader(
                 ds,
-                batch_size=args.batch_size,
+                batch_size=batch_size,
                 shuffle=False,
                 collate_fn=collate_fn,
-                num_workers=args.num_workers,
+                num_workers=num_workers,
                 pin_memory=True,
             )
 
             data = _extract_features(model, loader, device)
             np.savez_compressed(out_path, **data)
             feat_dim = data['features'].shape[1]
-            print(f"  → {data['features'].shape[0]} clips, feat_dim={feat_dim}  saved to {out_path}")
+            print(f"  -> {data['features'].shape[0]} clips, "
+                  f"feat_dim={feat_dim}  saved to {out_path}")
 
-    print("[INFO] Feature caching complete.")
+    print("[cache] Feature caching complete.")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry-point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pre-compute frozen backbone features for all fold splits.",
+    )
+    parser.add_argument('--backbone',    required=True,
+                        help='Backbone name, e.g. potr or motionbert')
+    parser.add_argument('--config',      required=True,
+                        help='Config JSON filename under configs/<backbone>/, '
+                             'e.g. BMCLab.json')
+    parser.add_argument('--num_folds',   type=int, default=-1,
+                        help='Number of CV folds. -1 = LOSO (auto-detect from dataset).')
+    parser.add_argument('--device',      default='cuda:0')
+    parser.add_argument('--batch_size',  type=int, default=256,
+                        help='Batch size for feature extraction (no grad)')
+    parser.add_argument('--out_root',    default='assets/cached_features',
+                        help='Root directory for cached .npz files')
+    parser.add_argument('--num_workers', type=int, default=4)
+    args = parser.parse_args()
+
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    print(f"[cache] Using device: {device}")
+
+    params = _load_params(args.backbone, args.config, args.num_folds)
+    folds  = range(1, params['num_folds'] + 1)
+
+    cache_all_folds(
+        params,
+        args.backbone,
+        folds,
+        device=device,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        out_root=args.out_root,
+    )
 
 
 if __name__ == '__main__':

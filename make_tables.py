@@ -410,14 +410,20 @@ def make_table3(folds: list[int], min_p_full: float, fmt: str) -> str:
                 row.append(_bold(_fmt(mn, sd, signed=True), mn, best))
             rows.append(tuple(row))
 
-            # PGU − Rand row
-            diff_pgu = {m: pgu_vals[m] - rand_vals[m] for m in METHODS}
-            means    = [v.mean() if len(v) else float("nan") for v in diff_pgu.values()]
-            best     = _best(means, higher=False)
-            row      = [f"PGU−Rand@{k} ↓"]
+            # PGU − Rand row: bold based on lowest absolute PGU, not most negative
+            # difference. A very negative PGU−Rand can simply reflect a high Rand
+            # baseline (e.g. zero-imputation always causes large shocks), not a
+            # genuinely low PGU. The winner is whoever has the smallest absolute PGU.
+            diff_pgu     = {m: pgu_vals[m] - rand_vals[m] for m in METHODS}
+            pgu_means    = [pgu_vals[m].mean() if len(pgu_vals[m]) else float("nan")
+                            for m in METHODS]
+            best_pgu     = _best(pgu_means, higher=False)
+            pgu_mn_by_m  = {m: (pgu_vals[m].mean() if len(pgu_vals[m]) else float("nan"))
+                            for m in METHODS}
+            row = [f"PGU−Rand@{k} ↓"]
             for m in METHODS:
                 mn, sd = _ms(diff_pgu[m])
-                row.append(_bold(_fmt(mn, sd, signed=True), mn, best))
+                row.append(_bold(_fmt(mn, sd, signed=True), pgu_mn_by_m[m], best_pgu))
             rows.append(tuple(row))
 
             rows.append(("", "", "", "", ""))  # spacer

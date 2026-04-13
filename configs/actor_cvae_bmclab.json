@@ -14,7 +14,7 @@
     "num_heads": 4,
     "dropout": 0.1,
     "num_classes": 3,
-    "_losses": "rc (direct root-centred XYZ MSE) + vel×5 (direct velocity MSE). No FK chain = unattenuated gradients. lambda_rr=0 because data is already root-centred in actor_batch_from_carepd. lambda_vel=5 gives vel gradient ~2-3x stronger than rc gradient, preventing mean-pose collapse.",
+    "_losses": "rc (XYZ MSE in global-pelvis repr: joint 0 = global pelvis, joints 1-16 = pelvis-relative) + vel×5 (velocity MSE: pelvis vel = global, other joints = relative-to-pelvis vel, good gait signal). lambda_rr must stay 0: joints 1-16 are already pelvis-relative, so the rr loss would subtract global_pelvis from relative coords producing a meaningless quantity. lambda_vel=5 gives vel gradient ~2-3x stronger than rc gradient, preventing mean-pose collapse.",
     "lambda_rc": 1.0,
     "lambda_rr": 0.0,
     "lambda_kl": 1e-05,

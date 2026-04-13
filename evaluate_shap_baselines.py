@@ -44,12 +44,11 @@ USAGE
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import sys
 from collections import defaultdict
-from typing import Callable, Optional
+from typing import Optional
 
 import numpy as np
 import torch
@@ -57,11 +56,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from argparse import Namespace
-
 from const import const
 from data.dataloaders import collate_fn
-from model.actor.backbone_projection import compute_zscore_stats, project_for_backbone
 from model.actor.cvae_data import actor_batch_from_carepd, get_carepd_datasets
 from model.actor.shap_compute import (
     compute_spatial_shap_baseline,
@@ -70,324 +66,29 @@ from model.actor.shap_compute import (
 from model.actor.shap_masking import build_temporal_windows, detect_stride_period
 from model.actor.shap_metrics import (
     _class_prob,
-    compute_deletion_insertion_auc,
-    compute_pgi_pgu,
-    compute_pgi_pgu_random,
     compute_shapley_completeness,
-    make_marginal_impute_fn,
-    make_mean_impute_fn,
-    make_zero_impute_fn,
+    compute_spatial_faithfulness_batched,
 )
-from model.backbone_loader import load_pretrained_backbone, load_pretrained_weights
 from model.motion_encoder import MotionEncoder
 
-
-# ---------------------------------------------------------------------------
-# Backbone param loading (for classifier instantiation only)
-# ---------------------------------------------------------------------------
-
-_PARAM_SEED_DEFAULTS: dict = {
-    'train_mode':         'classifier_only',
-    'seed':               0,
-    'tune_fresh':         1,
-    'ntrials':            1,
-    'this_run_num':       '0',
-    'readstudyfrom':      None,
-    'hypertune':          0,
-    'just_gen_dataset':   0,
-    'cross_dataset_test': 0,
-    'pretrained':         0,
-    'overwrite_results':  0,
-    'force_LODO':         0,
-    'AID':                0,
-    'combine_views_preds': 0,
-    'views_path':         None,
-    'exp_name_rigid':     None,
-    'prefer_right':       0,
-    'medication':         0,
-    'metadata':           [],
-    'tuned_model_config': None,
-}
-
-_BACKBONE_CONFIG_MODULE = {
-    'potr':           'configs.generate_config_potr',
-    'motionbert':     'configs.generate_config_motionbert',
-    'motionagformer': 'configs.generate_config_motionagformer',
-    'poseformerv2':   'configs.generate_config_poseformerv2',
-    'mixste':         'configs.generate_config_mixste',
-    'momask':         'configs.generate_config_momask',
-    'motionclip':     'configs.generate_config_motionclip',
-}
-
-
-def _load_backbone_params(backbone: str, config_file: str, num_folds: int) -> dict:
-    """Regenerate full param dict for *backbone* — used to instantiate MotionEncoder."""
-    mod = importlib.import_module(_BACKBONE_CONFIG_MODULE[backbone])
-    seed = {**_PARAM_SEED_DEFAULTS, 'backbone': backbone, 'config': config_file}
-    params, _ = mod.generate_config(seed, config_file)
-    params['num_folds']   = num_folds
-    params['num_classes'] = const.NUM_CLASSES_PER_DATASET[params['dataset']]
-    params['LODO']        = False
-    params.setdefault('classifier_hidden_dims', [])
-    params.setdefault('classifier_dropout', 0.0)
-    return params
-
-
-# ---------------------------------------------------------------------------
-# Raw H36M data loading (shared with evaluate_shap.py)
-# ---------------------------------------------------------------------------
-
-def _raw_data_args(backbone_params: dict, fold: int, batch_size: int = 1) -> Namespace:
-    """Build an argparse.Namespace for get_carepd_datasets from backbone params.
-
-    We load raw (un-normalised, un-centred) H36M data via the ActorCVAE
-    pipeline for ALL backbones.  Root-centering is applied by
-    actor_batch_from_carepd; per-backbone normalisation is applied inside
-    build_classifier_fn via project_for_backbone.
-
-    The source_seq_len is taken from the backbone's own config so that clips
-    have the same length as those the classifier was trained on.
-    """
-    return Namespace(
-        dataset=backbone_params['dataset'],
-        num_folds=backbone_params['num_folds'],
-        batch_size=batch_size,
-        experiment_name=backbone_params.get('experiment_name', 'Hypertune'),
-        fold=fold,
-        source_seq_len=backbone_params.get('source_seq_len', 80),
-        carepd_pose_npz=None,
-        carepd_labels_pkl=None,
-    )
-
-
-def build_train_pool(
-    backbone_params: dict,
-    fold: int,
-    device: torch.device,
-    max_sequences: int = 2000,
-    batch_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract training sequences in raw root-centred 3D for baselines.
-
-    Returns:
-        train_pool:  ``(N, J=17, F=3, T)`` float32, root-centred, on CPU.
-        joint_means: ``(J=17, F=3)`` per-joint training mean on *device*.
-    """
-    data_args = _raw_data_args(backbone_params, fold, batch_size=batch_size)
-    train_ds, _ = get_carepd_datasets(data_args)
-    loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=False,
-        num_workers=0, collate_fn=collate_fn,
-    )
-
-    seqs: list[torch.Tensor] = []
-    for x_raw, labels, _, _, pad_mask in loader:
-        batch = actor_batch_from_carepd(
-            x_raw.float(), pad_mask, backbone_params['num_classes'],
-            device=torch.device('cpu'), y=labels,
-        )
-        seqs.append(batch['x'])   # (B, J, F, T) root-centred
-        if sum(s.shape[0] for s in seqs) >= max_sequences:
-            break
-
-    train_pool  = torch.cat(seqs, dim=0)[:max_sequences]    # (N, J, F, T)
-    joint_means = train_pool.mean(dim=[0, 3]).to(device)    # (J, F)
-    return train_pool, joint_means
-
-
-# ---------------------------------------------------------------------------
-# Classifier loading
-# ---------------------------------------------------------------------------
-
-def load_motion_encoder(
-    classifier_ckpt: str,
-    backbone_params: dict,
-    device: torch.device,
-) -> MotionEncoder:
-    """Load a CARE-PD MotionEncoder from a checkpoint saved by run.py."""
-    backbone = load_pretrained_backbone(backbone_params, backbone_params['backbone'])
-    model = MotionEncoder(
-        backbone=backbone,
-        params=backbone_params,
-        num_classes=backbone_params['num_classes'],
-        train_mode=backbone_params.get('train_mode', 'classifier_only'),
-    )
-    ckpt = torch.load(classifier_ckpt, map_location=device)
-    weights = ckpt['model'] if 'model' in ckpt else ckpt
-    load_pretrained_weights(model, checkpoint=weights)
-    model.to(device).eval()
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Classifier wrapper with per-backbone projection
-# ---------------------------------------------------------------------------
-
-def build_classifier_fn(
-    motion_encoder: MotionEncoder,
-    mask: torch.Tensor,
-    backbone_name: str,
-    zscore_mean: Optional[torch.Tensor] = None,
-    zscore_std: Optional[torch.Tensor] = None,
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Wrap MotionEncoder as ``f(x: (1,J,F,T)) → logits (1,C)``.
-
-    Applies ``project_for_backbone`` to convert raw root-centred 3D input
-    into the correct normalised format for *backbone_name* before passing
-    to the MotionEncoder.
-
-    Args:
-        motion_encoder: Pretrained CARE-PD classifier.
-        mask:           ``(1, T)`` valid-frame bool mask (closed over per sequence).
-        backbone_name:  Backbone identifier for projection dispatch.
-        zscore_mean:    ``(J, F)`` z-score mean — required for POTR.
-        zscore_std:     ``(J, F)`` z-score std  — required for POTR.
-    """
-    @torch.no_grad()
-    def _fn(x_actor: torch.Tensor) -> torch.Tensor:
-        x_proj = project_for_backbone(
-            x_actor, backbone_name,
-            zscore_mean=zscore_mean,
-            zscore_std=zscore_std,
-            pad_mask=mask,
-        )
-        metadata = torch.zeros(x_proj.shape[0], 0, device=x_proj.device)
-        return motion_encoder(x_proj, metadata, valid_mask=mask)
-
-    return _fn
-
-
-# ---------------------------------------------------------------------------
-# Temporal faithfulness helpers
-# ---------------------------------------------------------------------------
-
-def _apply_temporal_mask(
-    x: torch.Tensor,
-    masked_window_indices: list[int],
-    window_assignments: list[list[int]],
-    method: str,
-    joint_means: Optional[torch.Tensor] = None,
-    train_pool: Optional[torch.Tensor] = None,
-    rng: "np.random.Generator | None" = None,
-) -> torch.Tensor:
-    """Return a copy of x with the specified windows replaced by baseline values."""
-    device = x.device
-    x_m = x.clone()
-    if not masked_window_indices:
-        return x_m
-    frames = torch.tensor(
-        [t for k in masked_window_indices for t in window_assignments[k]],
-        dtype=torch.long, device=device,
-    )
-    if method == "zero":
-        x_m[0, :, :, frames] = 0.0
-    elif method == "mean":
-        x_m[0, :, :, frames] = joint_means.unsqueeze(-1).expand(-1, -1, len(frames)).to(device)
-    else:  # marginal
-        if rng is None:
-            rng = np.random.default_rng(0)
-        d = int(rng.integers(0, train_pool.shape[0]))
-        # train_pool stays on CPU; index it with CPU indices (frames may be on CUDA for x_m).
-        x_m[0, :, :, frames] = train_pool[d, :, :, frames.cpu()].to(device)
-    return x_m
-
-
-def _temporal_deletion_insertion_auc(
-    classifier_fn: Callable,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    window_assignments: list[list[int]],
-    temporal_shap_vals: dict,
-    method: str,
-    joint_means: Optional[torch.Tensor] = None,
-    train_pool: Optional[torch.Tensor] = None,
-    seed: int = 0,
-) -> dict:
-    """Temporal deletion and insertion AUC over K=4 windows.
-
-    Deletion: start with full sequence, progressively remove windows in
-    decreasing SHAP-value order.  AUC = area under the 5-point curve.
-    Insertion: start with all windows masked, progressively reveal in same order.
-    """
-    K = len(window_assignments)
-    class_idx = int(y[0].item())
-    rng = np.random.default_rng(seed)
-
-    # Sort windows by decreasing SHAP value (most important first).
-    window_names = list(temporal_shap_vals.keys())
-    order = sorted(range(K), key=lambda k: -temporal_shap_vals[window_names[k]])
-
-    def _pred(x_in):
-        return _class_prob(classifier_fn, x_in, class_idx)
-
-    # Deletion curve: remove windows one by one.
-    del_curve = [_pred(x)]
-    for step in range(K):
-        x_m = _apply_temporal_mask(
-            x, order[: step + 1], window_assignments, method,
-            joint_means=joint_means, train_pool=train_pool, rng=rng,
-        )
-        del_curve.append(_pred(x_m))
-
-    # Insertion curve: start all-masked, reveal windows one by one.
-    x_empty = _apply_temporal_mask(
-        x, list(range(K)), window_assignments, method,
-        joint_means=joint_means, train_pool=train_pool, rng=rng,
-    )
-    ins_curve = [_pred(x_empty)]
-    for step in range(K):
-        still_masked = order[step + 1 :]
-        x_m = _apply_temporal_mask(
-            x, still_masked, window_assignments, method,
-            joint_means=joint_means, train_pool=train_pool, rng=rng,
-        )
-        ins_curve.append(_pred(x_m))
-
-    xs = np.linspace(0., 1., K + 1)
-    return {
-        "deletion_auc":  float(np.trapz(del_curve, xs)),
-        "insertion_auc": float(np.trapz(ins_curve, xs)),
-        "p_empty":       float(ins_curve[0]),
-    }
+# Shared utilities (backbone param loading, data helpers, classifier wrapper,
+# temporal faithfulness, output directory naming, p_full warning).
+from model.actor.shap_eval_shared import (
+    _load_backbone_params,
+    _raw_data_args,
+    build_train_pool,
+    build_zscore_stats_for_potr,
+    load_motion_encoder,
+    build_classifier_fn,
+    _temporal_deletion_insertion_auc_batched,
+    resolve_output_dir,
+    check_p_full_warning,
+)
 
 
 # ---------------------------------------------------------------------------
 # Per-sequence evaluation
 # ---------------------------------------------------------------------------
-
-def _faithfulness_block(
-    classifier_fn: Callable,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    mask: torch.Tensor,
-    lengths: torch.Tensor,
-    shap_vals: dict,
-    impute_fn: Callable,
-    p_full: float,
-    p_ref: float,
-    k_list: tuple[int, ...],
-    seq_idx: int,
-) -> dict:
-    pgi_pgu = compute_pgi_pgu(
-        classifier_fn, x, y, mask, lengths, shap_vals, impute_fn, k_list=k_list,
-    )
-    pgi_pgu_rand = compute_pgi_pgu_random(
-        classifier_fn, x, y, mask, lengths, impute_fn, k_list=k_list, seed=seq_idx,
-    )
-    del_ins = compute_deletion_insertion_auc(
-        classifier_fn, x, y, mask, lengths, shap_vals, impute_fn, seed=seq_idx,
-    )
-    comp_err = compute_shapley_completeness(shap_vals, p_full, p_ref)
-    return {
-        'pgi_pgu':              {str(k): v for k, v in pgi_pgu.items()},
-        'pgi_pgu_rand':         {str(k): v for k, v in pgi_pgu_rand.items()},
-        'deletion_auc':         del_ins['deletion_auc'],
-        'insertion_auc':        del_ins['insertion_auc'],
-        'random_deletion_auc':  del_ins['random_deletion_auc'],
-        'random_insertion_auc': del_ins['random_insertion_auc'],
-        'completeness_error':   comp_err,
-    }
-
 
 def evaluate_sequence(
     seq_idx: int,
@@ -415,12 +116,6 @@ def evaluate_sequence(
         zscore_mean=zscore_mean, zscore_std=zscore_std,
     )
 
-    impute_zero     = make_zero_impute_fn(classifier_fn)
-    impute_mean     = make_mean_impute_fn(classifier_fn, joint_means)
-    impute_marginal = make_marginal_impute_fn(
-        classifier_fn, train_pool, n_samples=n_completions, seed=seq_idx,
-    )
-
     # ------------------------------------------------------------------
     # Spatial SHAP (KernelSHAP, ~3000 coalitions over 17 joints)
     # ------------------------------------------------------------------
@@ -439,24 +134,25 @@ def evaluate_sequence(
         n_marginal_samples=n_completions, seed=seq_idx,
     )
 
-    zero_cm    = torch.zeros(1, 17, dtype=torch.bool, device=device)
     p_full     = _class_prob(classifier_fn, x, int(y[0].item()))
-    p_ref_zero = impute_zero(x, y, mask, lengths, zero_cm)
-    p_ref_mean = impute_mean(x, y, mask, lengths, zero_cm)
-    p_ref_marg = impute_marginal(x, y, mask, lengths, zero_cm)
+    p_ref_zero = shap_zero["_v_empty"]
+    p_ref_mean = shap_mean["_v_empty"]
+    p_ref_marg = shap_marginal["_v_empty"]
 
-    print(f'  [seq {seq_idx}] spatial faithfulness metrics …')
-    metrics_zero = _faithfulness_block(
-        classifier_fn, x, y, mask, lengths,
-        shap_zero, impute_zero, p_full, p_ref_zero, k_list, seq_idx,
+    print(f'  [seq {seq_idx}] spatial faithfulness metrics (batched) …')
+    metrics_zero = compute_spatial_faithfulness_batched(
+        classifier_fn, x, y, mask, lengths, shap_zero, 'zero',
+        k_list=k_list, p_full=p_full, p_ref=p_ref_zero, seq_idx=seq_idx,
     )
-    metrics_mean = _faithfulness_block(
-        classifier_fn, x, y, mask, lengths,
-        shap_mean, impute_mean, p_full, p_ref_mean, k_list, seq_idx,
+    metrics_mean = compute_spatial_faithfulness_batched(
+        classifier_fn, x, y, mask, lengths, shap_mean, 'mean',
+        joint_means=joint_means,
+        k_list=k_list, p_full=p_full, p_ref=p_ref_mean, seq_idx=seq_idx,
     )
-    metrics_marginal = _faithfulness_block(
-        classifier_fn, x, y, mask, lengths,
-        shap_marginal, impute_marginal, p_full, p_ref_marg, k_list, seq_idx,
+    metrics_marginal = compute_spatial_faithfulness_batched(
+        classifier_fn, x, y, mask, lengths, shap_marginal, 'marginal',
+        train_pool=train_pool, n_samples=n_completions,
+        k_list=k_list, p_full=p_full, p_ref=p_ref_marg, seq_idx=seq_idx,
     )
 
     # ------------------------------------------------------------------
@@ -481,10 +177,11 @@ def evaluate_sequence(
     t_shap_marginal = compute_temporal_shap_baseline(
         'marginal', classifier_fn, x, y, mask, lengths,
         window_assignments=window_assignments,
-        train_pool=train_pool, seed=seq_idx,
+        train_pool=train_pool, n_marginal_samples=n_completions,
+        seed=seq_idx,
     )
 
-    print(f'  [seq {seq_idx}] temporal faithfulness metrics …')
+    print(f'  [seq {seq_idx}] temporal faithfulness metrics (batched) …')
     t_methods = {
         'zero':     (t_shap_zero,     None,        None),
         'mean':     (t_shap_mean,     joint_means, None),
@@ -492,12 +189,15 @@ def evaluate_sequence(
     }
     t_faithfulness = {}
     for m_name, (t_shap, jm, tp) in t_methods.items():
-        del_ins = _temporal_deletion_insertion_auc(
+        t_window_names = [k for k in t_shap if not k.startswith('_')]
+        del_ins = _temporal_deletion_insertion_auc_batched(
             classifier_fn, x, y, window_assignments, t_shap, m_name,
             joint_means=jm, train_pool=tp, seed=seq_idx,
+            n_marginal_samples=n_completions,
         )
         comp_err = compute_shapley_completeness(
-            t_shap, p_full, del_ins['p_empty'], joint_names=list(t_shap.keys()),
+            t_shap, t_shap['_v_full'], t_shap['_v_empty'],
+            joint_names=t_window_names,
         )
         t_faithfulness[m_name] = {
             'deletion_auc':  del_ins['deletion_auc'],
@@ -605,8 +305,15 @@ def main() -> None:
         help='Path to latest_epoch.pth.tr saved by run.py.',
     )
     parser.add_argument(
-        '--output_dir', required=True,
-        help='Directory to write per_sequence.jsonl and aggregate.json.',
+        '--results_root', default=None,
+        help='Root directory for auto-structured results. Output path is derived as '
+             '{results_root}/{dataset}/{backbone}/fold{fold}/. '
+             'Mutually exclusive with --output_dir; one must be provided.',
+    )
+    parser.add_argument(
+        '--output_dir', default=None,
+        help='Explicit output directory (overrides --results_root). '
+             'Writes per_sequence.jsonl and aggregate.json.',
     )
     parser.add_argument(
         '--device', default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -618,13 +325,18 @@ def main() -> None:
     parser.add_argument('--max_train_pool', type=int, default=2000)
     parser.add_argument('--max_test_sequences', type=int, default=None,
                         help='Cap on test sequences (None = all; small values for debugging).')
+    parser.add_argument('--start_seq', type=int, default=0,
+                        help='Skip the first N test sequences (0-indexed). '
+                             'Use to resume a partially-completed run.')
     parser.add_argument('--train_pool_batch_size', type=int, default=64)
     parser.add_argument('--fps', type=float, default=30.0,
                         help='Capture frame-rate for stride-period detection (temporal SHAP).')
+    parser.add_argument('--root_centered', action='store_true', default=False,
+                        help='Subtract joint-0 (pelvis) so sequences are root-centred. '
+                             'Default: absolute world coordinates (no root-centering).')
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    os.makedirs(args.output_dir, exist_ok=True)
 
     cfg = {
         'n_kernel_samples':    args.n_kernel_samples,
@@ -638,6 +350,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     print('[1/4] Loading backbone params and classifier …')
     backbone_params = _load_backbone_params(args.backbone, args.config, args.num_folds)
+    backbone_name   = backbone_params['backbone']
+
+    # Resolve output directory (auto-derived or explicit).
+    output_dir = resolve_output_dir(
+        args.results_root, args.output_dir, backbone_params, args.fold,
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
     motion_encoder  = load_motion_encoder(args.classifier_ckpt, backbone_params, device)
 
     # ------------------------------------------------------------------
@@ -648,14 +368,23 @@ def main() -> None:
         backbone_params, args.fold, device,
         max_sequences=args.max_train_pool,
         batch_size=args.train_pool_batch_size,
+        root_centered=args.root_centered,
     )
     print(f'  train_pool: {tuple(train_pool.shape)}  '
           f'(J={train_pool.shape[1]}, F={train_pool.shape[2]}, T={train_pool.shape[3]})')
 
-    # Compute z-score stats from training pool (used only for POTR).
-    zscore_mean, zscore_std = compute_zscore_stats(train_pool)
-    zscore_mean = zscore_mean.to(device)
-    zscore_std  = zscore_std.to(device)
+    # Z-score stats: only needed for POTR (other backbones ignore them in
+    # project_for_backbone).  Computed over the train+test union to match
+    # POTRPreprocessor which normalises before fold splitting.
+    if backbone_name == 'potr':
+        print('  [potr] Computing z-score stats over train+test union …')
+        zscore_mean, zscore_std = build_zscore_stats_for_potr(
+            backbone_params, args.fold, device,
+            batch_size=args.train_pool_batch_size,
+            root_centered=args.root_centered,
+        )
+    else:
+        zscore_mean = zscore_std = None
 
     # ------------------------------------------------------------------
     # Load test data (same raw pipeline).
@@ -672,15 +401,18 @@ def main() -> None:
     # ------------------------------------------------------------------
     print('[4/4] Running per-sequence SHAP evaluation …')
     per_seq_results: list[dict] = []
-    jsonl_path = os.path.join(args.output_dir, 'per_sequence.jsonl')
+    jsonl_path = os.path.join(output_dir, 'per_sequence.jsonl')
 
     for seq_idx, raw_batch in enumerate(test_loader):
-        if args.max_test_sequences is not None and seq_idx >= args.max_test_sequences:
+        if seq_idx < args.start_seq:
+            continue
+        if args.max_test_sequences is not None and seq_idx >= args.start_seq + args.max_test_sequences:
             break
 
         x_raw, labels, _, _, pad_mask = raw_batch
         batch = actor_batch_from_carepd(
-            x_raw.float(), pad_mask, backbone_params['num_classes'], device, y=labels,
+            x_raw.float(), pad_mask, backbone_params['num_classes'], device,
+            y=labels, root_centered=args.root_centered,
         )
         x       = batch['x']        # (1, J, F, T) root-centred
         y       = batch['y']        # (1,)
@@ -689,7 +421,7 @@ def main() -> None:
 
         result = evaluate_sequence(
             seq_idx, x, y, mask, lengths,
-            motion_encoder, args.backbone, train_pool, joint_means,
+            motion_encoder, backbone_name, train_pool, joint_means,
             zscore_mean, zscore_std, cfg,
         )
         per_seq_results.append(result)
@@ -709,9 +441,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Aggregate and save.
     # ------------------------------------------------------------------
+    p_full_warning = check_p_full_warning(
+        per_seq_results, backbone_params['num_classes'], backbone_name,
+    )
+
     agg = aggregate_results(per_seq_results)
     agg['_meta'] = {
         'backbone':            args.backbone,
+        'dataset':             backbone_params['dataset'],
         'config':              args.config,
         'num_folds':           args.num_folds,
         'fold':                args.fold,
@@ -721,13 +458,16 @@ def main() -> None:
         'k_list':              args.k_list,
         'fps':                 args.fps,
         'classifier_ckpt':     args.classifier_ckpt,
+        'output_dir':          output_dir,
+        'p_full_warning':      p_full_warning,
     }
-    with open(os.path.join(args.output_dir, 'aggregate.json'), 'w') as fh:
+    with open(os.path.join(output_dir, 'aggregate.json'), 'w') as fh:
         json.dump(agg, fh, indent=2)
 
-    print(f'\nDone. Results written to {args.output_dir}/')
+    print(f'\nDone. Results written to {output_dir}/')
     print(f'  per_sequence.jsonl — {len(per_seq_results)} sequences')
     print(f'  aggregate.json     — means & stds for all metrics')
+    print(f'  backbone={args.backbone}  dataset={backbone_params["dataset"]}  fold={args.fold}')
     stride_rate = agg.get('stride_detected', {}).get('mean', float('nan'))
     print(f'\n--- Aggregate summary (mean ± std, {len(per_seq_results)} seqs) ---')
     print(f'  Stride auto-detected in {stride_rate * 100:.1f}% of sequences\n')

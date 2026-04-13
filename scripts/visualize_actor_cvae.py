@@ -49,6 +49,7 @@ from model.actor.cvae_data import (  # noqa: E402
     get_carepd_datasets,
     get_6dsmpl_datasets,
 )
+from model.actor.motion_utils import unroot_to_global  # noqa: E402
 from model.actor.cvae import ActorCVAE  # noqa: E402
 from model.actor.transformer_arch import (  # noqa: E402
     Decoder_TRANSFORMER,
@@ -117,6 +118,8 @@ def build_model_from_cfg(
         pose_rep=pose_rep,
         num_classes=cfg["num_classes"],
         rotation2xyz=rotation2xyz,
+        use_frame_tokens=cfg.get("use_frame_tokens",
+                                  not cfg.get("no_frame_tokens", False)),
     ).to(device)
 
 
@@ -197,9 +200,10 @@ def save_actor_recon_gifs(
     out_bjft = out.get("output_xyz", out["output"])   # (B, J, 3_or_F, T)
     mask_bt  = out["mask"]                            # (B, T)
 
-    # Permute to (B, T, J, 3) for frame-by-frame rendering
-    gt_btj3  = gt_bjft.permute(0, 3, 1, 2).cpu().numpy()
-    out_btj3 = out_bjft.permute(0, 3, 1, 2).cpu().numpy()
+    # Permute to (B, T, J, 3) and recover full global 3D from global-pelvis
+    # representation so the skeleton moves coherently in world space.
+    gt_btj3  = unroot_to_global(gt_bjft.permute(0, 3, 1, 2)).cpu().numpy()
+    out_btj3 = unroot_to_global(out_bjft.permute(0, 3, 1, 2)).cpu().numpy()
     m_np     = mask_bt.cpu().numpy()
 
     n_joints = gt_btj3.shape[2]

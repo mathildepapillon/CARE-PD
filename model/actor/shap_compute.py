@@ -148,21 +148,44 @@ def _solve_shapley_wls(
     coalitions: np.ndarray,
     values: np.ndarray,
     weights: np.ndarray,
+    v_empty: float | None = None,
+    v_full: float | None = None,
 ) -> np.ndarray:
     """Weighted least squares to estimate Shapley values.
 
     Fits the linear model f(z) ≈ φ_0 + Σ φⱼ zⱼ via weighted OLS.
     Rows with weight=0 (all-zeros/all-ones coalitions) contribute nothing.
 
+    If v_empty and v_full are provided, they are appended as high-weight
+    constraint rows (weight=1e6) to enforce the Shapley efficiency property
+    Σφⱼ ≈ v(full) − v(∅), following the constrained-WLS formulation of
+    Lundberg & Lee (2017).  Without these constraints the unconstrained WLS
+    only approximately satisfies efficiency (measured as completeness_error).
+
     Args:
         coalitions: (N, M) binary coalition matrix.
         values:     (N,) function values for each coalition.
         weights:    (N,) Shapley kernel weights.
+        v_empty:    value function on the all-masked coalition v(∅).
+        v_full:     value function on the all-observed coalition v(1).
 
     Returns:
         (M,) array of Shapley values φ_1, …, φ_M (intercept excluded).
     """
     M = coalitions.shape[1]
+
+    if v_empty is not None and v_full is not None:
+        # Append boundary coalitions with large weights as soft constraints.
+        # Weight 1e6 dominates interior kernel weights (~O(1/M)), enforcing
+        # φ_0 ≈ v_empty  and  φ_0 + Σφⱼ ≈ v_full  ⟹  Σφⱼ ≈ v_full − v_empty.
+        _BIG = 1e6
+        boundary_z = np.array([[0] * M, [1] * M], dtype=int)
+        boundary_v = np.array([v_empty, v_full])
+        boundary_w = np.full(2, _BIG)
+        coalitions = np.vstack([coalitions, boundary_z])
+        values     = np.concatenate([values, boundary_v])
+        weights    = np.concatenate([weights, boundary_w])
+
     keep = weights > 0
     Z = np.column_stack([np.ones(keep.sum()), coalitions[keep]])  # (K, M+1)
     w = np.sqrt(weights[keep])[:, None]
@@ -173,6 +196,59 @@ def _solve_shapley_wls(
     b_vec = Zw.T @ fw
     theta = np.linalg.solve(A, b_vec)
     return theta[1:]  # exclude intercept
+
+
+# ---------------------------------------------------------------------------
+# Batched classifier helper
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _batch_classify(
+    classifier: Callable,
+    x_list: list[torch.Tensor],
+    class_idx: int,
+    chunk_size: int = 256,
+) -> np.ndarray:
+    """Classify a list of (1, J, F, T) tensors in a small number of batched GPU calls.
+
+    Splits into chunks of ``chunk_size`` to bound peak GPU memory.  Returns a
+    1-D float array of length ``len(x_list)`` with the predicted probability
+    for ``class_idx`` for each input.
+    """
+    if not x_list:
+        return np.array([], dtype=np.float32)
+    probs: list[np.ndarray] = []
+    for start in range(0, len(x_list), chunk_size):
+        batch = torch.cat(x_list[start : start + chunk_size], dim=0)
+        logits = classifier(batch)
+        p = torch.softmax(logits, dim=-1)[:, class_idx].cpu().numpy()
+        probs.append(p)
+    return np.concatenate(probs)
+
+
+@torch.no_grad()
+def _classify_chunked(
+    classifier: Callable,
+    x_batch: torch.Tensor,  # (N, J, F, T) already on device
+    class_idx: int,
+    chunk_size: int = 256,
+) -> np.ndarray:
+    """Classify a pre-stacked (N, J, F, T) tensor in chunks.
+
+    Unlike ``_batch_classify``, takes a single contiguous tensor instead of a
+    list — avoids the overhead of ``torch.cat`` on every chunk and is the
+    preferred path for vectorised baseline evaluation.
+    """
+    N = x_batch.shape[0]
+    if N == 0:
+        return np.array([], dtype=np.float32)
+    probs: list[np.ndarray] = []
+    for start in range(0, N, chunk_size):
+        chunk = x_batch[start : start + chunk_size]
+        logits = classifier(chunk)
+        p = torch.softmax(logits, dim=-1)[:, class_idx].cpu().numpy()
+        probs.append(p)
+    return np.concatenate(probs)
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +285,8 @@ def value_fn(
         x, y, mask, lengths, coalition_mask, n_samples=n_samples
     )
     class_idx = int(y[0].item())
-    probs = []
-    for x_hat in completions:
-        logits = classifier(x_hat)
-        p = float(torch.softmax(logits, dim=-1)[0, class_idx].item())
-        probs.append(p)
-    return float(np.mean(probs))
+    probs = _batch_classify(classifier, completions, class_idx)
+    return float(probs.mean())
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +430,7 @@ def compute_spatial_shap(
     n_kernel_samples: int = 3000,
     n_completion_samples: int = 20,
     seed: int | None = None,
+    batch_chunk_size: int = 256,
 ) -> dict[str, float]:
     """Compute per-joint Shapley values via KernelSHAP.
 
@@ -366,9 +439,15 @@ def compute_spatial_shap(
     group (H36M_GROUPS).  This preserves the Shapley axioms at the joint level
     while enabling clinical group-level summaries.
 
+    All classifier calls across all coalitions are batched into a small number
+    of GPU forward passes (controlled by ``batch_chunk_size``) rather than one
+    call per coalition.  VAEAC completion calls are still sequential per
+    coalition; batching the classifier typically gives ~10–50× speedup.
+
     Args:
         model:               ActorSHAP.
-        classifier:          callable(x_hat: Tensor) → logits Tensor(1, n_classes).
+        classifier:          callable(x_hat: Tensor(B,J,F,T)) → logits Tensor(B,n_classes).
+                             Must support batch size > 1.
         x:                   (1, J, F, T) single sequence (B=1).
         y:                   (1,) class label.
         mask:                (1, T) real-frame mask.
@@ -377,6 +456,7 @@ def compute_spatial_shap(
                              (total coalitions evaluated = 2 * n_kernel_samples).
         n_completion_samples: stochastic completions averaged per coalition.
         seed:                optional random seed for reproducibility.
+        batch_chunk_size:    max sequences per batched classifier forward pass.
 
     Returns:
         dict with keys:
@@ -386,27 +466,52 @@ def compute_spatial_shap(
     M = 17
     device = x.device
     rng = np.random.default_rng(seed)
+    class_idx = int(y[0].item())
 
     coalitions, weights = _sample_kernel_coalitions(M, n_kernel_samples, rng)
 
-    values = np.zeros(len(coalitions))
-    for i, z in enumerate(coalitions):
-        observed = np.where(z == 1)[0].tolist()
-        if len(observed) == 0:
-            # All-masked: replace all joints; value is model output on pure sample.
-            observed = []
-        cm = build_spatial_shap_mask(observed, device, n_joints=M).unsqueeze(0)
-        values[i] = value_fn(model, classifier, x, y, mask, lengths, cm,
-                             n_samples=n_completion_samples)
+    # Build all coalition masks including boundaries (empty=index 0, full=index 1).
+    zero_cm = build_spatial_shap_mask([], device, n_joints=M).unsqueeze(0)
+    full_cm = build_spatial_shap_mask(list(range(M)), device, n_joints=M).unsqueeze(0)
+    all_cms: list[torch.Tensor] = [zero_cm, full_cm] + [
+        build_spatial_shap_mask(np.where(z == 1)[0].tolist(), device, n_joints=M).unsqueeze(0)
+        for z in coalitions
+    ]
 
-    phi = _solve_shapley_wls(coalitions, values, weights)
+    # Generate completions for every coalition (VAEAC calls sequential per coalition),
+    # then classify all completions in a single batched pass.
+    all_completions: list[torch.Tensor] = []
+    slice_ends: list[int] = []
+    for cm in all_cms:
+        comps = model.sample_completions(
+            x, y, mask, lengths, cm, n_samples=n_completion_samples
+        )
+        all_completions.extend(comps)
+        slice_ends.append(len(all_completions))
+
+    all_probs = _batch_classify(classifier, all_completions, class_idx,
+                                chunk_size=batch_chunk_size)
+
+    # Average probabilities within each coalition's completion block.
+    starts = [0] + slice_ends[:-1]
+    all_values = np.array([
+        float(all_probs[s:e].mean())
+        for s, e in zip(starts, slice_ends)
+    ])
+
+    v_empty = all_values[0]
+    v_full  = all_values[1]
+    values  = all_values[2:]
+
+    phi = _solve_shapley_wls(coalitions, values, weights, v_empty=v_empty, v_full=v_full)
 
     result: dict[str, float] = {
         H36M_JOINT_NAMES[j]: float(phi[j]) for j in range(M)
     }
     for group_name, joint_indices in H36M_GROUPS.items():
         result[group_name] = float(sum(phi[j] for j in joint_indices))
-
+    result["_v_empty"] = float(v_empty)
+    result["_v_full"]  = float(v_full)
     return result
 
 
@@ -465,16 +570,39 @@ def compute_temporal_shap(
         window_names = PHASE_LABELS
 
     coalitions, weights = _enumerate_all_coalitions(K)
-    values = np.zeros(len(coalitions))
+    class_idx = int(y[0].item())
 
-    for i, z in enumerate(coalitions):
-        observed = [k for k in range(K) if z[k] == 1]
-        cm = build_temporal_shap_mask(observed, window_assignments, T, device).unsqueeze(0)
-        values[i] = value_fn(model, classifier, x, y, mask, lengths, cm,
-                             n_samples=n_completion_samples)
+    # Build all coalition masks and generate completions, then batch-classify.
+    all_cms = [
+        build_temporal_shap_mask(
+            [k for k in range(K) if z[k] == 1], window_assignments, T, device
+        ).unsqueeze(0)
+        for z in coalitions
+    ]
+    all_completions: list[torch.Tensor] = []
+    slice_ends: list[int] = []
+    for cm in all_cms:
+        comps = model.sample_completions(
+            x, y, mask, lengths, cm, n_samples=n_completion_samples
+        )
+        all_completions.extend(comps)
+        slice_ends.append(len(all_completions))
 
-    phi = _solve_shapley_wls(coalitions, values, weights)
-    return {window_names[k]: float(phi[k]) for k in range(K)}
+    all_probs = _batch_classify(classifier, all_completions, class_idx)
+    starts = [0] + slice_ends[:-1]
+    values = np.array([
+        float(all_probs[s:e].mean()) for s, e in zip(starts, slice_ends)
+    ])
+
+    # itertools.product([0,1], K) produces all-zeros first and all-ones last.
+    v_empty = float(values[0])
+    v_full  = float(values[-1])
+
+    phi = _solve_shapley_wls(coalitions, values, weights, v_empty=v_empty, v_full=v_full)
+    result = {window_names[k]: float(phi[k]) for k in range(K)}
+    result["_v_empty"] = v_empty
+    result["_v_full"]  = v_full
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -524,26 +652,89 @@ def compute_spatial_shap_baseline(
         raise ValueError("train_pool is required for method='marginal'")
 
     M = 17
+    J, F, T = x.shape[1], x.shape[2], x.shape[3]
     device = x.device
     rng = np.random.default_rng(seed)
+    class_idx = int(y[0].item())
 
     coalitions, weights = _sample_kernel_coalitions(M, n_kernel_samples, rng)
-    values = np.zeros(len(coalitions))
 
-    for i, z in enumerate(coalitions):
-        cm = torch.tensor(z, dtype=torch.bool, device=device).unsqueeze(0)  # (1, M)
-        if method == "zero":
-            values[i] = value_fn_zero(classifier, x, y, cm)
-        elif method == "mean":
-            values[i] = value_fn_mean(classifier, x, y, cm, joint_means)
-        else:
-            values[i] = value_fn_marginal(classifier, x, y, cm, train_pool, rng,
-                                           n_samples=n_marginal_samples)
+    # Stack all coalition masks into a single (N_total, J) tensor — avoids
+    # per-coalition Python overhead in the vectorised masking below.
+    cms_np = np.vstack([
+        np.zeros((1, M), dtype=bool),
+        np.ones((1, M),  dtype=bool),
+        np.array(coalitions, dtype=bool),   # (2*n_kernel_samples, M)
+    ])  # (N_total, M)
+    N_total = cms_np.shape[0]
+    all_cms_t = torch.tensor(cms_np, dtype=torch.bool, device=device)  # (N_total, J)
 
-    phi = _solve_shapley_wls(coalitions, values, weights)
+    # mask_b: (N_total, J, 1, 1) — True = observed (kept), False = masked (replaced)
+    mask_b = all_cms_t[:, :, None, None]  # broadcasts over F and T
+
+    if method == "zero":
+        # Vectorised: zero out masked joints for every coalition at once.
+        # x.expand() is a zero-copy view; torch.where allocates the output once.
+        x_batch = torch.where(
+            mask_b,
+            x.expand(N_total, -1, -1, -1),
+            torch.zeros(1, J, F, T, dtype=x.dtype, device=device).expand(N_total, -1, -1, -1),
+        )  # (N_total, J, F, T)
+        all_values = _classify_chunked(classifier, x_batch, class_idx)
+
+    elif method == "mean":
+        mean_fill = joint_means.unsqueeze(-1).expand(-1, -1, T)   # (J, F, T)
+        x_batch = torch.where(
+            mask_b,
+            x.expand(N_total, -1, -1, -1),
+            mean_fill.unsqueeze(0).expand(N_total, -1, -1, -1),
+        )  # (N_total, J, F, T)
+        all_values = _classify_chunked(classifier, x_batch, class_idx)
+
+    else:  # marginal
+        # Pre-sample all donor indices upfront: (N_total, n_marginal_samples).
+        # Process coalitions in outer chunks so the per-chunk donor tensor fits
+        # in GPU memory comfortably.
+        N_pool    = train_pool.shape[0]
+        all_idx   = rng.integers(0, N_pool, size=(N_total, n_marginal_samples))
+        COAL_CHUNK = 64  # coalitions per outer iteration
+
+        all_values_list: list[np.ndarray] = []
+        x0 = x[0]  # (J, F, T)
+
+        for c0 in range(0, N_total, COAL_CHUNK):
+            c1 = min(c0 + COAL_CHUNK, N_total)
+            C  = c1 - c0
+
+            # One bulk CPU→GPU transfer per outer chunk instead of per-sample.
+            donors = train_pool[all_idx[c0:c1]].to(device)  # (C, n_marg, J, F, T)
+
+            # Vectorised masking across all C coalitions × n_marg donors.
+            # cm_b: (C, 1, J, 1, 1) — broadcasts over (C, n_marg, J, F, T)
+            cm_b = all_cms_t[c0:c1][:, None, :, None, None]
+            x_out = torch.where(
+                cm_b,                            # (C, 1, J, 1, 1) → (C, n_marg, J, F, T)
+                x0[None, None, :, :, :],         # (1, 1, J, F, T) → (C, n_marg, J, F, T)
+                donors,                           # (C, n_marg, J, F, T)
+            )  # (C, n_marg, J, F, T)
+            x_flat = x_out.reshape(C * n_marginal_samples, J, F, T)
+
+            probs_c = _classify_chunked(classifier, x_flat, class_idx)  # (C*n_marg,)
+            per_coal = probs_c.reshape(C, n_marginal_samples).mean(axis=1)  # (C,)
+            all_values_list.append(per_coal)
+
+        all_values = np.concatenate(all_values_list)  # (N_total,)
+
+    v_empty = float(all_values[0])
+    v_full  = float(all_values[1])
+    values  = np.array(all_values[2:], dtype=np.float64)
+
+    phi = _solve_shapley_wls(coalitions, values, weights, v_empty=v_empty, v_full=v_full)
     result: dict[str, float] = {H36M_JOINT_NAMES[j]: float(phi[j]) for j in range(M)}
     for group_name, joint_indices in H36M_GROUPS.items():
         result[group_name] = float(sum(phi[j] for j in joint_indices))
+    result["_v_empty"] = float(v_empty)
+    result["_v_full"]  = float(v_full)
     return result
 
 
@@ -599,45 +790,64 @@ def compute_temporal_shap_baseline(
         window_names = PHASE_LABELS
 
     coalitions, weights = _enumerate_all_coalitions(K)
-    values = np.zeros(len(coalitions))
+    class_idx = int(y[0].item())
 
-    for i, z in enumerate(coalitions):
-        observed_windows = [k for k in range(K) if z[k] == 1]
-        # Build a (J,) spatial mask where all joints are "observed" in observed windows
-        # and "masked" in the remaining windows.  Then apply replacement per frame.
-        x_perturbed = x.clone()
-        masked_frames = [
-            t for k in range(K) if k not in observed_windows
-            for t in window_assignments[k]
-        ]
-        if masked_frames:
-            mf = torch.tensor(masked_frames, dtype=torch.long)
-            if method == "zero":
-                x_perturbed[0, :, :, mf] = 0.0
-            elif method == "mean":
-                # joint_means: (J, F) → (J, F, 1) → broadcast to (J, F, n_frames)
-                mean_exp = joint_means.unsqueeze(-1).expand(-1, -1, len(mf)).to(device)
-                x_perturbed[0, :, :, mf] = mean_exp
+    # Build all perturbed sequences for every coalition, then batch-classify.
+    if method in ("zero", "mean"):
+        x_batch_list: list[torch.Tensor] = []
+        for z in coalitions:
+            observed_windows = [k for k in range(K) if z[k] == 1]
+            masked_frames = [
+                t for k in range(K) if k not in observed_windows
+                for t in window_assignments[k]
+            ]
+            x_p = x.clone()
+            if masked_frames:
+                mf = torch.tensor(masked_frames, dtype=torch.long)
+                if method == "zero":
+                    x_p[0, :, :, mf] = 0.0
+                else:
+                    mean_exp = joint_means.unsqueeze(-1).expand(-1, -1, len(mf)).to(device)
+                    x_p[0, :, :, mf] = mean_exp
+            x_batch_list.append(x_p)
+        all_probs = _batch_classify(classifier, x_batch_list, class_idx)
+        values = all_probs
+
+    else:  # marginal
+        N_pool = train_pool.shape[0]
+        all_coal_values: list[float] = []
+
+        for z in coalitions:
+            observed_windows = [k for k in range(K) if z[k] == 1]
+            masked_frames = [
+                t for k in range(K) if k not in observed_windows
+                for t in window_assignments[k]
+            ]
+            donor_idx = rng.integers(0, N_pool, size=n_marginal_samples)
+            # Bulk transfer donors for this coalition (n_marg, J, F, T).
+            donors = train_pool[donor_idx].to(device)   # (n_marg, J, F, T)
+            if masked_frames:
+                mf = torch.tensor(masked_frames, dtype=torch.long, device=device)
+                # x0: (J, F, n_frames) — observed frames stay; masked frames come from donors
+                x0 = x[0].clone()                       # (J, F, T)
+                x_rep = x0.unsqueeze(0).expand(n_marginal_samples, -1, -1, -1).clone()
+                x_rep[:, :, :, mf] = donors[:, :, :, mf]
             else:
-                # marginal: sample a random training sequence, copy its frames
-                donors = [int(rng.integers(0, train_pool.shape[0]))
-                          for _ in range(n_marginal_samples)]
-                samples_p = []
-                for d in donors:
-                    xp = x.clone()
-                    xp[0, :, :, mf] = train_pool[d, :, :, mf].to(device)
-                    logits = classifier(xp)
-                    class_idx = int(y[0].item())
-                    samples_p.append(float(torch.softmax(logits, dim=-1)[0, class_idx]))
-                values[i] = float(np.mean(samples_p))
-                continue  # marginal handles its own averaging
+                x_rep = x[0].unsqueeze(0).expand(n_marginal_samples, -1, -1, -1)
+            probs = _classify_chunked(classifier, x_rep, class_idx)
+            all_coal_values.append(float(probs.mean()))
 
-        logits = classifier(x_perturbed)
-        class_idx = int(y[0].item())
-        values[i] = float(torch.softmax(logits, dim=-1)[0, class_idx].item())
+        values = np.array(all_coal_values)
 
-    phi = _solve_shapley_wls(coalitions, values, weights)
-    return {window_names[k]: float(phi[k]) for k in range(K)}
+    # itertools.product([0,1], K) produces all-zeros first and all-ones last.
+    v_empty = float(values[0])
+    v_full  = float(values[-1])
+
+    phi = _solve_shapley_wls(coalitions, values, weights, v_empty=v_empty, v_full=v_full)
+    result = {window_names[k]: float(phi[k]) for k in range(K)}
+    result["_v_empty"] = v_empty
+    result["_v_full"]  = v_full
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +865,7 @@ if __name__ == "__main__":
             return [torch.randn_like(x) for _ in range(n_samples)]
 
     def _mock_classifier(x_hat):
-        return torch.randn(1, 3)
+        return torch.randn(x_hat.shape[0], 3)
 
     model = _MockModel()
     x = torch.randn(B, J, F, T)
@@ -668,8 +878,10 @@ if __name__ == "__main__":
         model, _mock_classifier, x, y, mask, lengths,
         n_kernel_samples=10, n_completion_samples=2, seed=42,
     )
-    assert set(s_result.keys()) == set(H36M_JOINT_NAMES) | set(H36M_GROUPS.keys())
-    print(f"Spatial SHAP OK — {len(s_result)} keys")
+    _EXPECTED_SPATIAL = set(H36M_JOINT_NAMES) | set(H36M_GROUPS.keys()) | {"_v_empty", "_v_full"}
+    assert set(s_result.keys()) == _EXPECTED_SPATIAL
+    assert "_v_empty" in s_result and "_v_full" in s_result
+    print(f"Spatial SHAP OK — {len(s_result)} keys (includes _v_empty/_v_full)")
 
     # ActorSHAP temporal SHAP.
     windows = build_temporal_windows(T, stride_period=8, K=4)
@@ -677,7 +889,8 @@ if __name__ == "__main__":
         model, _mock_classifier, x, y, mask, lengths,
         window_assignments=windows, n_completion_samples=2,
     )
-    assert len(t_result) == 4
+    assert len(t_result) == 6  # 4 windows + _v_empty + _v_full
+    assert "_v_empty" in t_result and "_v_full" in t_result
     print(f"Temporal SHAP OK — {list(t_result.keys())}")
 
     # Zero-baseline spatial SHAP.
@@ -685,7 +898,7 @@ if __name__ == "__main__":
         "zero", _mock_classifier, x, y, mask, lengths,
         n_kernel_samples=10, seed=0,
     )
-    assert set(z_result.keys()) == set(H36M_JOINT_NAMES) | set(H36M_GROUPS.keys())
+    assert set(z_result.keys()) == _EXPECTED_SPATIAL
     print(f"Zero-baseline spatial SHAP OK — {len(z_result)} keys")
 
     # Mean-baseline spatial SHAP.
@@ -694,7 +907,7 @@ if __name__ == "__main__":
         "mean", _mock_classifier, x, y, mask, lengths,
         joint_means=joint_means, n_kernel_samples=10, seed=0,
     )
-    assert set(m_result.keys()) == set(H36M_JOINT_NAMES) | set(H36M_GROUPS.keys())
+    assert set(m_result.keys()) == _EXPECTED_SPATIAL
     print(f"Mean-baseline spatial SHAP OK")
 
     # Marginal-baseline spatial SHAP.
@@ -703,15 +916,18 @@ if __name__ == "__main__":
         "marginal", _mock_classifier, x, y, mask, lengths,
         train_pool=train_pool, n_kernel_samples=4, n_marginal_samples=2, seed=0,
     )
-    assert set(mg_result.keys()) == set(H36M_JOINT_NAMES) | set(H36M_GROUPS.keys())
+    assert set(mg_result.keys()) == _EXPECTED_SPATIAL
     print(f"Marginal-baseline spatial SHAP OK")
+
+    _EXPECTED_TEMPORAL = 6  # 4 windows + _v_empty + _v_full
 
     # Zero-baseline temporal SHAP.
     zt_result = compute_temporal_shap_baseline(
         "zero", _mock_classifier, x, y, mask, lengths,
         window_assignments=windows,
     )
-    assert len(zt_result) == 4
+    assert len(zt_result) == _EXPECTED_TEMPORAL
+    assert "_v_empty" in zt_result and "_v_full" in zt_result
     print(f"Zero-baseline temporal SHAP OK — {list(zt_result.keys())}")
 
     # Mean-baseline temporal SHAP.
@@ -719,7 +935,7 @@ if __name__ == "__main__":
         "mean", _mock_classifier, x, y, mask, lengths,
         window_assignments=windows, joint_means=joint_means,
     )
-    assert len(mt_result) == 4
+    assert len(mt_result) == _EXPECTED_TEMPORAL
     print(f"Mean-baseline temporal SHAP OK")
 
     # Marginal-baseline temporal SHAP.
@@ -728,7 +944,7 @@ if __name__ == "__main__":
         window_assignments=windows, train_pool=train_pool,
         n_marginal_samples=2, seed=0,
     )
-    assert len(mgt_result) == 4
+    assert len(mgt_result) == _EXPECTED_TEMPORAL
     print(f"Marginal-baseline temporal SHAP OK")
 
     # Kernel weight sanity.

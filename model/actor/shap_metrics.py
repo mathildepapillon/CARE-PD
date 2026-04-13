@@ -247,11 +247,12 @@ def make_actor_impute_fn(
 ) -> Callable:
     """Return an impute_fn that uses ActorSHAP manifold-constrained completions."""
     def _fn(x, y, mask, lengths, coalition_mask):
+        from model.actor.shap_compute import _batch_classify
         completions = model.sample_completions(x, y, mask, lengths, coalition_mask,
                                                n_samples=n_samples)
         class_idx = int(y[0].item())
-        return float(np.mean([_class_prob(classifier, xh, class_idx)
-                               for xh in completions]))
+        probs = _batch_classify(classifier, completions, class_idx)
+        return float(probs.mean())
     return _fn
 
 
@@ -620,6 +621,223 @@ def extract_encoder_features(
 def _class_prob(classifier: Callable, x_hat: torch.Tensor, class_idx: int) -> float:
     logits = classifier(x_hat)
     return float(torch.softmax(logits, dim=-1)[0, class_idx].item())
+
+
+# ---------------------------------------------------------------------------
+# Batched faithfulness — all spatial metrics in one pass
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_spatial_faithfulness_batched(
+    classifier_fn: Callable,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    lengths: torch.Tensor,
+    shap_values: dict[str, float],
+    method: str,
+    *,
+    joint_means: torch.Tensor | None = None,
+    train_pool: torch.Tensor | None = None,
+    actor_shap: Any | None = None,
+    n_samples: int = 20,
+    k_list: tuple[int, ...] = (1, 2, 3, 5),
+    n_random_repeats: int = 10,
+    p_full: float | None = None,
+    p_ref: float | None = None,
+    seq_idx: int = 0,
+    chunk_size: int = 256,
+) -> dict:
+    """Compute PGI/PGU, PGI/PGU-random, deletion/insertion AUC, and
+    completeness error for one SHAP method in a single batched pass.
+
+    Replaces the sequential pattern of ``compute_pgi_pgu`` +
+    ``compute_pgi_pgu_random`` + ``compute_deletion_insertion_auc`` +
+    ``compute_shapley_completeness``.  All coalition perturbations are built
+    upfront and classified in large batched GPU calls, reducing thousands of
+    B=1 forward passes to a handful of B=chunk_size passes.
+
+    Args:
+        method:     ``"zero"`` | ``"mean"`` | ``"marginal"`` | ``"actor"``.
+        n_samples:  Donor draws (marginal) or completions (actor) per coalition.
+        seq_idx:    Seed for random PGI/PGU joint selection and random
+                    deletion/insertion order — matches ``seed=`` in the
+                    individual metric functions for reproducibility.
+
+    Returns:
+        Same dict structure as the ``_faithfulness_block`` pattern in
+        ``evaluate_shap*.py``.
+    """
+    from model.actor.shap_compute import _batch_classify, _classify_chunked
+    from model.actor.shap_masking import H36M_JOINT_NAMES
+
+    device = x.device
+    J, F, T = x.shape[1], x.shape[2], x.shape[3]
+    class_idx = int(y[0].item())
+    joint_names = H36M_JOINT_NAMES
+
+    if p_full is None:
+        p_full = _class_prob(classifier_fn, x, class_idx)
+
+    # --- 1. Build all observed-joint lists for every evaluation point ---
+    ranked = sorted(
+        range(J),
+        key=lambda j: abs(shap_values.get(joint_names[j], 0.0)),
+        reverse=True,
+    )
+    ranked_least = list(reversed(ranked))
+
+    rng_py = random.Random(seq_idx)
+    rng_np = np.random.default_rng(seq_idx)
+    random_order = rng_np.permutation(J).tolist()
+    all_joints = list(range(J))
+
+    observed_lists: list[list[int]] = []
+    idx_pgi: dict[int, int] = {}
+    idx_pgu: dict[int, int] = {}
+    idx_rand: dict[int, list[int]] = {}
+    idx_del: list[int] = []
+    idx_ins: list[int] = []
+    idx_rdel: list[int] = []
+    idx_rins: list[int] = []
+
+    def _append(obs: list[int]) -> int:
+        i = len(observed_lists)
+        observed_lists.append(obs)
+        return i
+
+    for k in k_list:
+        if k > J:
+            continue
+        idx_pgi[k] = _append([j for j in range(J) if j not in ranked[:k]])
+        idx_pgu[k] = _append([j for j in range(J) if j not in ranked_least[:k]])
+
+    for k in k_list:
+        if k > J:
+            continue
+        idxs: list[int] = []
+        for _ in range(n_random_repeats):
+            masked = rng_py.sample(all_joints, k)
+            idxs.append(_append([j for j in all_joints if j not in masked]))
+        idx_rand[k] = idxs
+
+    for step in range(J + 1):
+        idx_del.append(_append([j for j in range(J) if j not in ranked[:step]]))
+        idx_ins.append(_append(list(ranked[:step])))
+        idx_rdel.append(_append([j for j in range(J) if j not in random_order[:step]]))
+        idx_rins.append(_append(list(random_order[:step])))
+
+    N = len(observed_lists)
+
+    # --- 2. Boolean coalition mask tensor (N, J) ---
+    cms_np = np.zeros((N, J), dtype=bool)
+    for i, obs in enumerate(observed_lists):
+        for j in obs:
+            cms_np[i, j] = True
+    cms_t = torch.tensor(cms_np, dtype=torch.bool, device=device)
+
+    # --- 3. Build perturbed inputs and classify ---
+    if method == "zero":
+        mask_b = cms_t[:, :, None, None]
+        x_batch = torch.where(
+            mask_b,
+            x.expand(N, -1, -1, -1),
+            torch.zeros(1, 1, 1, 1, dtype=x.dtype, device=device),
+        )
+        all_probs = _classify_chunked(
+            classifier_fn, x_batch, class_idx, chunk_size=chunk_size,
+        )
+
+    elif method == "mean":
+        mean_fill = joint_means.unsqueeze(-1).expand(-1, -1, T)
+        mask_b = cms_t[:, :, None, None]
+        x_batch = torch.where(
+            mask_b,
+            x.expand(N, -1, -1, -1),
+            mean_fill.unsqueeze(0).expand(N, -1, -1, -1),
+        )
+        all_probs = _classify_chunked(
+            classifier_fn, x_batch, class_idx, chunk_size=chunk_size,
+        )
+
+    elif method == "marginal":
+        rng_donors = np.random.default_rng(seq_idx + (1 << 31))
+        N_pool = train_pool.shape[0]
+        donor_indices = rng_donors.integers(0, N_pool, size=(N, n_samples))
+        COAL_CHUNK = 32
+        all_probs_parts: list[np.ndarray] = []
+        x0 = x[0]
+
+        for c0 in range(0, N, COAL_CHUNK):
+            c1 = min(c0 + COAL_CHUNK, N)
+            C = c1 - c0
+            donors = train_pool[donor_indices[c0:c1]].to(device)
+            cm_b = cms_t[c0:c1, None, :, None, None]
+            x_out = torch.where(cm_b, x0[None, None], donors)
+            x_flat = x_out.reshape(C * n_samples, J, F, T)
+            probs_c = _classify_chunked(
+                classifier_fn, x_flat, class_idx, chunk_size=chunk_size,
+            )
+            all_probs_parts.append(
+                probs_c.reshape(C, n_samples).mean(axis=1),
+            )
+        all_probs = np.concatenate(all_probs_parts)
+
+    elif method == "actor":
+        if actor_shap is None:
+            raise ValueError("actor_shap is required for method='actor'")
+        all_completions: list[torch.Tensor] = []
+        slice_ends: list[int] = []
+        for i in range(N):
+            comps = actor_shap.sample_completions(
+                x, y, mask, lengths, cms_t[i : i + 1], n_samples=n_samples,
+            )
+            all_completions.extend(comps)
+            slice_ends.append(len(all_completions))
+        all_comp_probs = _batch_classify(
+            classifier_fn, all_completions, class_idx, chunk_size=chunk_size,
+        )
+        starts = [0] + slice_ends[:-1]
+        all_probs = np.array([
+            all_comp_probs[s:e].mean() for s, e in zip(starts, slice_ends)
+        ])
+
+    else:
+        raise ValueError(f"Unknown method: {method!r}")
+
+    # --- 4. Extract metrics ---
+    pgi_pgu: dict[int, dict[str, float]] = {}
+    for k in k_list:
+        if k > J:
+            continue
+        pgi_pgu[k] = {
+            "pgi": abs(p_full - float(all_probs[idx_pgi[k]])),
+            "pgu": abs(p_full - float(all_probs[idx_pgu[k]])),
+        }
+
+    pgi_pgu_rand: dict[int, dict[str, float]] = {}
+    for k in k_list:
+        if k > J:
+            continue
+        gaps = [abs(p_full - float(all_probs[i])) for i in idx_rand[k]]
+        avg = float(np.mean(gaps))
+        pgi_pgu_rand[k] = {"pgi": avg, "pgu": avg}
+
+    dx = 1.0 / max(J, 1)
+    del_probs = [float(all_probs[i]) for i in idx_del]
+    ins_probs = [float(all_probs[i]) for i in idx_ins]
+    rdel_probs = [float(all_probs[i]) for i in idx_rdel]
+    rins_probs = [float(all_probs[i]) for i in idx_rins]
+
+    return {
+        "pgi_pgu":              {str(k): v for k, v in pgi_pgu.items()},
+        "pgi_pgu_rand":         {str(k): v for k, v in pgi_pgu_rand.items()},
+        "deletion_auc":         float(np.trapz(del_probs, dx=dx)),
+        "insertion_auc":        float(np.trapz(ins_probs, dx=dx)),
+        "random_deletion_auc":  float(np.trapz(rdel_probs, dx=dx)),
+        "random_insertion_auc": float(np.trapz(rins_probs, dx=dx)),
+        "completeness_error":   compute_shapley_completeness(shap_values, p_full, p_ref),
+    }
 
 
 # ---------------------------------------------------------------------------

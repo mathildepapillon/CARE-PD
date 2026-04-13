@@ -22,6 +22,7 @@ train_gaitvae.py
 
 artifacts/shap_gifs/*
 artifacts/viz_best/*
+artifacts/actor_recon_gifs_*
 
 logs/*
 results/*

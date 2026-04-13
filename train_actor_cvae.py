@@ -49,6 +49,7 @@ import sys
 
 import pytorch_lightning as pl
 import torch
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from data.dataloaders import collate_fn
 from model.actor.cvae import ActorCVAE
@@ -59,7 +60,7 @@ from model.actor.cvae_data import (
     get_6dsmpl_datasets,
 )
 from model.actor.transformer_arch import Decoder_TRANSFORMER, Encoder_TRANSFORMER
-from train_gaitvae_lightning import make_trainer
+from train_utils import make_trainer
 from utility.utils import set_random_seed
 
 _SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
@@ -325,7 +326,8 @@ def parse_args():
         "--carepd_labels_pkl", type=str, default=None,
         help="Override labels PKL path.",
     )
-    p.add_argument("--num_folds", type=int, default=6)
+    p.add_argument("--num_folds", type=int, default=23,
+                   help="Number of CV folds. BMCLab canonical = 23 (LOSO by patient).")
     p.add_argument("--fold", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--source_seq_len", type=int, default=81,
@@ -418,6 +420,13 @@ def parse_args():
         help="Save recon GIFs every N epochs (0 to disable).",
     )
     p.add_argument("--recon_gif_fps", type=int, default=12)
+    p.add_argument(
+        "--no_frame_tokens", action="store_true", default=False,
+        help="Train in z-only mode: frame_tokens produced by the encoder are NOT "
+             "forwarded to the decoder.  Forces z to encode full temporal dynamics "
+             "rather than delegating per-frame reconstruction to frame_tokens. "
+             "Required for ActorSHAP to produce diverse completions from z.",
+    )
     p.add_argument(
         "--smpl_path", type=str, default=None,
         help="Override SMPL_NEUTRAL.pkl path (6dsmpl mode only).",
@@ -540,6 +549,7 @@ def main():
         pose_rep=args.pose_rep,
         num_classes=args.num_classes,
         rotation2xyz=rotation2xyz,
+        use_frame_tokens=not args.no_frame_tokens,
     ).to(device)
 
     # ---- Load datasets ---------------------------------------------------
@@ -577,6 +587,16 @@ def main():
         lr_gamma=args.lr_gamma,
     )
     extra_cb: list[pl.Callback] = []
+    # Always save the last-epoch checkpoint so it can be used as an ActorSHAP
+    # initialiser even when it isn't the best val/mixed checkpoint.
+    extra_cb.append(
+        ModelCheckpoint(
+            dirpath=ckpt_dir,
+            every_n_epochs=args.epochs,   # fires exactly once: at the final epoch
+            filename="actor_cvae_last",
+            save_top_k=1,
+        )
+    )
     if args.recon_gif_every_n_epochs > 0:
         extra_cb.append(
             ActorCvaeReconGifCallback(
@@ -598,7 +618,8 @@ def main():
         extra_callbacks=extra_cb or None,
     )
     trainer.fit(module, train_loader, val_loader)
-    print(f"Done. Checkpoints: {ckpt_dir}")
+    print(f"Done. Best checkpoint : {os.path.join(ckpt_dir, 'actor_cvae_best.ckpt')}")
+    print(f"      Last checkpoint : {os.path.join(ckpt_dir, 'actor_cvae_last.ckpt')}")
 
 
 if __name__ == "__main__":

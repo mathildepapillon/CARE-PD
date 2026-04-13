@@ -79,6 +79,7 @@ class ActorCVAE(nn.Module):
         pose_rep: str = "xyz",
         num_classes: int = 1,
         rotation2xyz: Optional[Callable] = None,
+        use_frame_tokens: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -90,6 +91,11 @@ class ActorCVAE(nn.Module):
         self.num_classes = num_classes
         self.device = device
         self.rotation2xyz = rotation2xyz
+        # When False, frame_tokens produced by the encoder are NOT forwarded to
+        # the decoder.  The decoder must then reconstruct all T frames from z
+        # alone (z-only mode).  This forces z to encode full temporal dynamics,
+        # which is required for diverse ActorSHAP completions.
+        self.use_frame_tokens = use_frame_tokens
 
         # Validate: rcxyz loss requires FK for rot6d data.
         if "rcxyz" in self.lambdas and pose_rep == "rot6d" and rotation2xyz is None:
@@ -139,11 +145,9 @@ class ActorCVAE(nn.Module):
             batch["x_xyz"] = self.rotation2xyz(batch["x"], batch["mask"])
 
         # ---- Encoder + reparameterisation + decoder ----------------------
-        # The encoder returns mu, logvar, and frame_tokens (T per-frame
-        # encoder representations).  frame_tokens are threaded through the
-        # batch so the decoder can use them as additional memory, giving each
-        # decoder cross-attention position a frame-specific key/value pair.
         batch.update(self.encoder(batch))
+        if not self.use_frame_tokens:
+            batch.pop("frame_tokens", None)
         batch["z"] = self.reparameterize(batch)
         batch.update(self.decoder(batch))
 

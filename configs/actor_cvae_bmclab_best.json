@@ -2,7 +2,7 @@
     "_source": "Best run from sweep ia0cpnfy — actor_carepd_BMCLab_fold1_20260407_122132 (val/mixed=0.000187, epoch 99)",
     "dataset": "BMCLab",
     "data_mode": "carepd",
-    "num_folds": 6,
+    "num_folds": 23,
     "fold": 1,
     "seed": 0,
     "batch_size": 32,

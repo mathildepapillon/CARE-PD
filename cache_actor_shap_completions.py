@@ -80,9 +80,9 @@ from tqdm import tqdm
 from data.dataloaders import collate_fn
 from evaluate_shap import (
     _load_backbone_params,
-    _raw_data_args,
     load_actor_shap,
 )
+from model.actor.shap_eval_shared import _raw_data_args, raw_seq_len
 from model.actor.actor_shap import ActorSHAP
 from model.actor.cvae_data import actor_batch_from_carepd, get_carepd_datasets
 from model.actor.shap_compute import _sample_kernel_coalitions, build_spatial_shap_mask
@@ -251,7 +251,13 @@ def parse_args():
                         "lower than evaluate_shap's --n_completion_samples just means "
                         "the cached value_fn averages over fewer samples — still valid).")
     p.add_argument("--output_dir", required=True,
-                   help="Directory to write per-sequence NPZ files.")
+                   help="Root directory for per-sequence NPZ files.  The "
+                        "sequence length T (from the backbone's source_seq_len) "
+                        "is automatically appended as '_T{T}' so that caches for "
+                        "different backbone lengths are kept separate, e.g. "
+                        "my_cache_dir_T80 for POTR and my_cache_dir_T90 for "
+                        "MotionBERT.  If the dir already ends with '_T<N>' it is "
+                        "used as-is.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--max_sequences", type=int, default=None,
                    help="Cap total test sequences (for quick tests).")
@@ -262,10 +268,21 @@ def parse_args():
     return p.parse_args()
 
 
+def _t_tagged_dir(base_dir: str, seq_len: int) -> str:
+    """Return *base_dir* guaranteed to end with ``_T{seq_len}``.
+
+    If *base_dir* already ends with ``_T<digits>`` it is returned unchanged,
+    so callers that already include the tag do not get a double suffix.
+    """
+    import re
+    if re.search(r'_T\d+$', base_dir):
+        return base_dir
+    return f"{base_dir}_T{seq_len}"
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device)
-    os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"[1/4] Loading ActorSHAP from {args.actor_shap_ckpt} ...")
     model = load_actor_shap(args.actor_shap_ckpt, device,
@@ -276,6 +293,14 @@ def main():
     backbone_params = _load_backbone_params(args.backbone, args.config, args.num_folds)
     backbone_params["dataset"] = backbone_params.get("dataset", "BMCLab")
     backbone_params["num_folds"] = args.num_folds
+
+    # Tag the output directory with T so caches for different backbone
+    # sequence lengths are kept separate (e.g. _T80 for POTR, _T90 for
+    # MotionBERT).  _raw_data_args uses the same seq_len via raw_seq_len().
+    seq_len = raw_seq_len(backbone_params)
+    output_dir = _t_tagged_dir(args.output_dir, seq_len)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"  [cache] Output dir: {output_dir}  (T={seq_len})")
 
     data_args = _raw_data_args(backbone_params, args.fold, batch_size=1)
     _, test_ds = get_carepd_datasets(data_args)
@@ -312,7 +337,7 @@ def main():
             num_classes=3, device=device, y=labels,
         )
 
-        out_path = os.path.join(args.output_dir, f"seq_{seq_idx:05d}.npz")
+        out_path = os.path.join(output_dir, f"seq_{seq_idx:05d}.npz")
         if os.path.isfile(out_path):
             skipped += 1
             continue
@@ -323,7 +348,7 @@ def main():
             model=model,
             n_kernel_samples=args.n_kernel_samples,
             n_completion_samples=args.n_completion_samples,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
         )
         saved += 1
 

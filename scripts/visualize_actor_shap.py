@@ -41,6 +41,7 @@ sys.path.insert(0, _SCRIPTS)
 import viz_utils  # noqa: E402
 from data.dataloaders import collate_fn  # noqa: E402
 from model.actor.cvae_data import actor_batch_from_carepd, get_carepd_datasets  # noqa: E402
+from model.actor.motion_utils import unroot_to_global  # noqa: E402
 from model.actor.shap_masking import (  # noqa: E402
     H36M_GROUPS,
     H36M_JOINT_NAMES,
@@ -298,6 +299,7 @@ def run_completion_gif(
     seed: int,
     paste_observed: bool,
     verbose: bool,
+    legacy_world_coords: bool = False,
 ) -> None:
     torch.manual_seed(seed)
     x = batch["x"][b : b + 1]
@@ -313,8 +315,17 @@ def run_completion_gif(
 
     gt_bjft = batch.get("x_xyz", batch["x"])[b : b + 1]
     real_len = int(mask[0].sum().item())
-    gt_btj3 = gt_bjft[:, :, :, :real_len].permute(0, 3, 1, 2).cpu().numpy()
-    out_btj3 = x_hat[:, :, :, :real_len].permute(0, 3, 1, 2).cpu().numpy()
+    gt_btj3_t  = gt_bjft[:, :, :, :real_len].permute(0, 3, 1, 2)
+    out_btj3_t = x_hat[:, :, :, :real_len].permute(0, 3, 1, 2)
+    if legacy_world_coords:
+        # Old checkpoints output raw world-space coords — no unrooting needed.
+        gt_btj3  = gt_btj3_t.cpu().numpy()
+        out_btj3 = out_btj3_t.cpu().numpy()
+    else:
+        # Recover full global 3D from global-pelvis representation so the whole
+        # skeleton moves coherently in world space during rendering.
+        gt_btj3  = unroot_to_global(gt_btj3_t).cpu().numpy()
+        out_btj3 = unroot_to_global(out_btj3_t).cpu().numpy()
 
     edges = viz_utils.edges_for_njoints(gt_btj3.shape[2])
     viz_utils.save_motion_comparison_gif(
@@ -358,6 +369,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0, help="Base RNG seed (incremented per GIF).")
     p.add_argument("--no_paste", action="store_true", help="Do not paste observed inputs into the output.")
     p.add_argument(
+        "--legacy_world_coords", action="store_true",
+        help="Use raw world-space coordinates (no global-pelvis transform, no unrooting). "
+             "Required for checkpoints trained before the global-pelvis representation was introduced.",
+    )
+    p.add_argument(
         "--spatial",
         choices=("none", "groups", "single", "custom"),
         default="groups",
@@ -384,6 +400,8 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated stride window indices 0–3 for stride_observe_one / stride_mask_one "
         "(default: all four gait phases).",
     )
+    p.add_argument("--num_workers", type=int, default=0,
+                   help="DataLoader workers (0 = main process only; avoids CUDA fork deadlocks).")
     p.add_argument("--list_presets", action="store_true", help="Print joint groups/names and exit.")
     return p.parse_args()
 
@@ -431,7 +449,7 @@ def main() -> None:
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=min(4, batch_size),
+        num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
 
@@ -445,6 +463,7 @@ def main() -> None:
         x, lab, _vidx, _meta, pad_mask = batch_raw
         bdict = actor_batch_from_carepd(
             x.to(device), pad_mask.to(device), model.num_classes, device, y=lab.to(device),
+            world_coords=args.legacy_world_coords,
         )
         if model.pose_rep == "xyz":
             bdict["x_xyz"] = bdict["x"]
@@ -472,6 +491,7 @@ def main() -> None:
                     seed=seed,
                     paste_observed=not args.no_paste,
                     verbose=True,
+                    legacy_world_coords=args.legacy_world_coords,
                 )
                 seed += 1
                 gif_count += 1

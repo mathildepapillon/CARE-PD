@@ -121,7 +121,14 @@ class CoalitionFullEncoder(nn.Module):
 
         patched_batch = {**batch, "x": x}
         out = self._encoder(patched_batch)
-        return {"mu_full": out["mu"], "logvar_full": out["logvar"]}
+        # Pass per-frame encoder tokens through so the decoder can use them
+        # for frame-specific cross-attention rather than generating all T frames
+        # from a single global z token (which collapses to mean-pose).
+        return {
+            "mu_full": out["mu"],
+            "logvar_full": out["logvar"],
+            "frame_tokens": out["frame_tokens"],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +201,11 @@ class MaskedActorEncoder(nn.Module):
 
         patched_batch = {**batch, "x": x}
         out = self._encoder(patched_batch)
-        return {"mu_masked": out["mu"], "logvar_masked": out["logvar"]}
+        return {
+            "mu_masked":          out["mu"],
+            "logvar_masked":      out["logvar"],
+            "frame_tokens_masked": out.get("frame_tokens"),
+        }
 
     def _encode_temporal(self, batch: dict) -> dict:
         """Overwrite unobserved frame embeddings with mask token after skelEmbedding.
@@ -239,7 +250,13 @@ class MaskedActorEncoder(nn.Module):
         # Step 4: Transformer encoder.
         final = enc.seqTransEncoder(xseq, src_key_padding_mask=~maskseq)
 
-        return {"mu_masked": final[0], "logvar_masked": final[1]}
+        # final[0] = mu token, final[1] = sigma token (direct outputs of muQuery/sigmaQuery).
+        # final[2:] = per-frame tokens for decoder cross-attention.
+        return {
+            "mu_masked":           final[0],
+            "logvar_masked":       final[1],
+            "frame_tokens_masked": final[2:],  # (T, B, latent_dim)
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +295,7 @@ class ActorSHAP(nn.Module):
         device: torch.device,
         pose_rep: str = "xyz",
         num_classes: int = 3,
+        use_frame_tokens: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -288,7 +306,8 @@ class ActorSHAP(nn.Module):
         self.pose_rep = pose_rep
         self.num_classes = num_classes
         self.device = device
-        self.losses = ["rc", "kl", "reg", "mixed"]
+        self.use_frame_tokens = use_frame_tokens
+        self.losses = ["rc", "vel", "kl", "reg", "mixed"]
 
     # ------------------------------------------------------------------
     # Reparameterisation
@@ -341,28 +360,52 @@ class ActorSHAP(nn.Module):
         if self.pose_rep == "xyz":
             batch["x_xyz"] = batch["x"]
 
-        # Run coalition-aware full encoder q_ϕ(z|x,S).
-        # Phase 1: coalition_mask absent → no target markers → plain encoding.
-        # Phase 2: coalition_mask present → coalition-specific z target for r_ψ.
-        # Gradient flows freely (no no_grad wrapper — q_ϕ is trainable).
-        out_full = self.encoder(batch)
-        batch["mu_full"]     = out_full["mu_full"]
-        batch["logvar_full"] = out_full["logvar_full"]
-
-        # z is ALWAYS sampled from q_ϕ.
-        # Reparameterization carries gradient to both μ_ϕ and σ_ϕ.
-        batch["mu"]    = batch["mu_full"]
-        batch["logvar"] = batch["logvar_full"]
-
-        if phase == 2:
-            # Run masked encoder r_ψ(z|x_S,S) — parameters stored for KL only.
-            # r_ψ receives NO gradient from the decoder/reconstruction path.
-            # Its gradient comes entirely from the KL term in compute_loss.
+        if phase == 3:
+            # Inference-only path: z ~ r_ψ(z|x_S, S).
+            # q_ϕ is skipped entirely — no full-sequence information leaks to the decoder.
+            # frame_tokens are never set here (use_frame_tokens=False for z-only CVAEs,
+            # and for frame-tokens CVAEs, passing frame_tokens_masked would freeze masked
+            # joints due to constant mask_token_spatial).
             masked_out = self.masked_encoder(batch)
             batch["mu_masked"]     = masked_out["mu_masked"]
             batch["logvar_masked"] = masked_out["logvar_masked"]
+            batch["mu"]     = batch["mu_masked"]
+            batch["logvar"] = batch["logvar_masked"]
+        else:
+            # Run coalition-aware full encoder q_ϕ(z|x,S).
+            # Phase 1: coalition_mask absent → no target markers → plain encoding.
+            # Phase 2: coalition_mask present → coalition-specific z target for r_ψ.
+            # Gradient flows freely (no no_grad wrapper — q_ϕ is trainable).
+            out_full = self.encoder(batch)
+            batch["mu_full"]      = out_full["mu_full"]
+            batch["logvar_full"]  = out_full["logvar_full"]
+            if self.use_frame_tokens:
+                # Per-frame encoder tokens enable frame-specific decoder cross-attention.
+                # Only used when the CVAE was trained with frame_tokens (use_frame_tokens=True).
+                # For z-only CVAEs the decoder never saw frame_tokens during training, so
+                # passing them here would corrupt the reconstruction.
+                batch["frame_tokens"] = out_full["frame_tokens"]
 
-        batch["z"] = self.reparameterize(batch)   # z ~ q_ϕ
+            # z is sampled from q_ϕ during training.
+            batch["mu"]    = batch["mu_full"]
+            batch["logvar"] = batch["logvar_full"]
+
+            if phase == 2:
+                # Run masked encoder r_ψ(z|x_S,S).
+                # KL training: r_ψ learns to match q_ϕ's posterior.
+                # Auxiliary reconstruction (lambda_rc_psi > 0): r_ψ also receives
+                # direct reconstruction gradient by running the decoder a second
+                # time with z ~ r_ψ in compute_loss.  This closes the
+                # training/inference gap where r_ψ's mu_masked differs from q_ϕ's.
+                masked_out = self.masked_encoder(batch)
+                batch["mu_masked"]           = masked_out["mu_masked"]
+                batch["logvar_masked"]       = masked_out["logvar_masked"]
+                if self.use_frame_tokens:
+                    # Store r_ψ frame_tokens for the auxiliary decoder pass.
+                    batch["frame_tokens_masked"] = masked_out.get("frame_tokens_masked")
+                # z is still sampled from q_ϕ for the primary VAEAC ELBO.
+
+        batch["z"] = self.reparameterize(batch)   # z ~ q_ϕ (phase 1/2) or r_ψ (phase 3)
         batch.update(self.decoder(batch))
 
         if self.pose_rep == "xyz":
@@ -379,7 +422,10 @@ class ActorSHAP(nn.Module):
         batch: dict,
         lambda_kl: float = 1.0,
         lambda_reg: float = 1e-6,
+        lambda_rc_psi: float = 0.0,
         lambda_kl_full: float = 1e-4,
+        lambda_vel: float = 5.0,
+        lambda_rc_obs: float = 0.1,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Proper VAEAC ELBO (Olsen 2022, Eq. 6 + Sec. 3.3.1).
 
@@ -392,23 +438,45 @@ class ActorSHAP(nn.Module):
             = 0.5 · Σ[ log(σ²_ψ/σ²_ϕ) + (σ²_ϕ + (μ_ϕ−μ_ψ)²)/σ²_ψ − 1 ]
 
         Gradient routing:
-            ∂L/∂θ (decoder):       reconstruction only.
-            ∂L/∂ϕ (full encoder):  reconstruction (via reparameterization)
-                                   + KL numerator (μ_ϕ, σ²_ϕ terms).
-            ∂L/∂ψ (masked encoder): KL denominator (μ_ψ, σ²_ψ terms)
-                                    + prior regularization.
-                                    ZERO from reconstruction.
+            ∂L/∂θ (decoder):           reconstruction + velocity + rc_psi.
+            ∂L/∂ϕ_marker (q_ϕ target_marker_spatial only):
+                                       reconstruction + velocity (via reparameterization).
+                                       q_ϕ._encoder is FROZEN — no weight drift.
+            ∂L/∂ψ (masked encoder):    KL denominator (μ_ψ, σ²_ψ terms)
+                                       + prior regularization
+                                       + rc_psi (auxiliary reconstruction via z~r_ψ).
 
         Args:
             batch:      output of forward() — must contain "x", "output",
                         "mask", "coalition_mask", "mu_full", "logvar_full",
                         "mu_masked", "logvar_masked".
-            lambda_kl:  KL weight (linearly annealed by the Lightning module).
-            lambda_reg: weight for prior regularization on r_ψ parameters.
+            lambda_kl:     KL weight (linearly annealed by the Lightning module).
+            lambda_reg:    weight for prior regularization on r_ψ parameters.
+            lambda_kl_full: weight for KL(q_ϕ ‖ N(0,I)).
+            lambda_vel:    weight for velocity (frame-delta) MSE on held-out
+                           positions.  Matches ActorCVAE's lambda_vel=5.0 to
+                           preserve temporal coherence learned during pre-training.
+            lambda_rc_obs: weight for reconstruction MSE on *observed* joints.
+                           Prevents the decoder from drifting on joints it never
+                           receives held-out gradients for.  Keeps full-sequence
+                           reconstruction quality intact when paste_observed=False.
+                           Set to 0.0 to match the strict VAEAC ELBO.
+            lambda_rc_psi: weight for auxiliary reconstruction MSE via z~r_ψ.
+                           Runs the decoder a second time with z sampled from
+                           r_ψ (instead of q_ϕ) and computes held-out reconstruction
+                           loss.  This gradient flows to BOTH r_ψ (direct signal
+                           to move mu_masked toward a decodable region) and the
+                           decoder (to handle r_ψ's z), closing the training/inference
+                           gap.  Without this, r_ψ only learns via KL (chasing a
+                           moving q_ϕ target), which at 100 epochs can leave a
+                           ~18x MPJPE gap between training-path (z~q_ϕ) and
+                           inference-path (z~r_ψ) reconstructions.
+                           Set to 0.0 to revert to strict VAEAC ELBO.
 
         Returns:
             (loss, losses_dict) — loss is the scalar for backward();
-            losses_dict contains "rc", "kl", "reg", "mixed" as floats.
+            losses_dict contains "rc", "rc_obs", "rc_psi", "vel", "kl", "reg",
+            "kl_full", "mixed" as floats.
         """
         x               = batch["x"]
         output          = batch["output"]
@@ -431,6 +499,23 @@ class ActorSHAP(nn.Module):
         reconstruction_mask = held_out & real_frames
         n_masked = reconstruction_mask.float().sum().clamp(min=1.0)
         rc = ((output - x).pow(2) * reconstruction_mask.float()).sum() / n_masked
+
+        # Reconstruction on observed joints — prevents decoder from drifting on joints
+        # that receive zero gradient from the held-out reconstruction loss.
+        observed_mask = (~held_out) & real_frames
+        n_obs = observed_mask.float().sum().clamp(min=1.0)
+        rc_obs = ((output - x).pow(2) * observed_mask.float()).sum() / n_obs
+
+        # ------------------------------------------------------------------
+        # Velocity: MSE on frame-deltas of held-out positions.
+        # Mirrors ActorCVAE's vel loss but restricted to unobserved components,
+        # consistent with the VAEAC likelihood formulation.
+        # ------------------------------------------------------------------
+        gt_vel  = x[..., 1:] - x[..., :-1]           # (B, J, F, T-1)
+        out_vel = output[..., 1:] - output[..., :-1]  # (B, J, F, T-1)
+        vel_mask = reconstruction_mask[..., 1:] & reconstruction_mask[..., :-1]
+        n_vel = vel_mask.float().sum().clamp(min=1.0)
+        vel = ((out_vel - gt_vel).pow(2) * vel_mask.float()).sum() / n_vel
 
         # ------------------------------------------------------------------
         # Forward KL: KL( q_ϕ(z|x,S) ‖ r_ψ(z|x_S,S) )
@@ -513,9 +598,61 @@ class ActorSHAP(nn.Module):
             mu_phi_nd.pow(2) + lv_phi_nd.exp() - lv_phi_nd - 1.0
         ).sum(dim=-1).mean()
 
-        loss = rc + lambda_kl * kl + lambda_reg * reg + lambda_kl_full * kl_full
+        # ------------------------------------------------------------------
+        # Auxiliary reconstruction via z ~ r_ψ  (lambda_rc_psi > 0).
+        #
+        # Motivation: during training z is always sampled from q_ϕ, so the
+        # decoder only learns to decode q_ϕ's z.  r_ψ is updated only through
+        # KL(q_ϕ ‖ r_ψ), which chases a moving target.  In practice this leaves
+        # mu_masked ≠ mu_full (confirmed: ~18x MPJPE gap at epoch 100 with
+        # lambda_rc_psi=0).  Adding this term gives r_ψ a direct reconstruction
+        # gradient and trains the decoder to also handle r_ψ's z, bridging the
+        # training/inference gap.
+        #
+        # Gradient routing (differs from the primary VAEAC path):
+        #   ∂rc_psi/∂ψ  — r_ψ moves mu/logvar toward a region the decoder can use.
+        #   ∂rc_psi/∂θ  — decoder adapts to r_ψ's z distribution.
+        #   q_ϕ (ϕ) receives NO gradient from rc_psi (z_psi is sampled from r_ψ).
+        # ------------------------------------------------------------------
+        rc_psi = x.new_zeros(())
+        if lambda_rc_psi > 0.0 and "mu_masked" in batch and "logvar_masked" in batch:
+            std_psi = (0.5 * batch["logvar_masked"]).exp()
+            z_psi   = torch.randn_like(std_psi) * std_psi + batch["mu_masked"]
+            # Use r_ψ's per-frame tokens if available; otherwise fall back to q_ϕ's.
+            ft_psi  = batch.get("frame_tokens_masked")
+            dec_batch = {**batch, "z": z_psi}
+            if ft_psi is not None:
+                dec_batch = {**dec_batch, "frame_tokens": ft_psi}
+            out_psi = self.decoder(dec_batch)["output"]
+            # Spatial reconstruction on ALL real-frame joints.
+            # The held-out mask would exclude joint 0 (pelvis, always observed), but
+            # with paste_observed=False the decoder must reconstruct joint 0 from z~r_ψ.
+            # A bad pelvis shifts the entire skeleton globally, so full-sequence
+            # supervision is essential for perceptually correct completions.
+            n_real  = real_frames.float().sum().clamp(min=1.0)
+            rc_psi  = ((out_psi - x).pow(2) * real_frames.float()).sum() / n_real
+            # Velocity supervision on r_ψ's decoder output.
+            # Without this the decoder learns to produce mean-pose (temporally flat)
+            # for r_ψ's z: MSE is minimised by the conditional mean, which has ~zero
+            # velocity.  Adding the same lambda_vel as the primary path ensures the
+            # decoder is trained to produce temporal dynamics for BOTH q_ϕ and r_ψ z.
+            if lambda_vel > 0.0 and out_psi.shape[-1] > 1:
+                real_shifted = real_frames[..., 1:] & real_frames[..., :-1]  # (B,J,F,T-1)
+                n_vel   = real_shifted.float().sum().clamp(min=1.0)
+                vel_psi = (
+                    (out_psi[..., 1:] - out_psi[..., :-1]).pow(2)
+                    * real_shifted.float()
+                ).sum() / n_vel
+                rc_psi  = rc_psi + lambda_vel * vel_psi
+
+        loss = (rc + lambda_rc_obs * rc_obs + lambda_rc_psi * rc_psi
+                + lambda_vel * vel
+                + lambda_kl * kl + lambda_reg * reg + lambda_kl_full * kl_full)
         return loss, {
             "rc":      float(rc.detach()),
+            "rc_obs":  float(rc_obs.detach()),
+            "rc_psi":  float(rc_psi.detach()),
+            "vel":     float(vel.detach()),
             "kl":      float(kl.detach()),
             "reg":     float(reg.detach()),
             "kl_full": float(kl_full.detach()),
@@ -566,8 +703,9 @@ class ActorSHAP(nn.Module):
         for _ in range(n_samples):
             b = {k: v.clone() if isinstance(v, torch.Tensor) else v
                  for k, v in base_batch.items()}
-            # Inference uses r_ψ → z → p_θ, matching VAEAC deployment phase.
-            b = self.forward(b, phase=2)
+            # Phase 3: inference path — z ~ r_ψ, frame_tokens from r_ψ.
+            # q_ϕ is NOT used so no held-out joint information leaks to the decoder.
+            b = self.forward(b, phase=3)
             x_hat = b["output"].clone()
             if paste_observed:
                 x_hat[obs_mask] = x[obs_mask]
@@ -595,9 +733,10 @@ class ActorSHAP(nn.Module):
         MaskedActorEncoder._encoder from the ActorCVAE encoder weights, and
         decoder from the ActorCVAE decoder weights.
 
-        IMPORTANT: the full encoder (q_ϕ) is NO LONGER FROZEN.  It must be
-        trained jointly so that target_marker_spatial can learn to produce
-        coalition-specific z values and provide meaningful KL targets for r_ψ.
+        After loading, the training script freezes q_ϕ._encoder and trains ONLY
+        target_marker_spatial (for coalition-aware input perturbations) + r_ψ + p_θ.
+        Keeping q_ϕ's base weights frozen prevents distribution drift and lets
+        r_ψ converge against a stable, fixed KL target.
 
         Args:
             ckpt_path: path to a PyTorch Lightning checkpoint saved by
@@ -626,10 +765,10 @@ class ActorSHAP(nn.Module):
         # Initialize decoder from ActorCVAE decoder weights.
         self.decoder.load_state_dict(dec_sd)
 
-        # NOTE: self.encoder is NOT frozen — it is trained jointly with r_ψ and p_θ.
+        # NOTE: q_ϕ._encoder is frozen by configure_optimizers in the training script.
+        # Only target_marker_spatial is trained (coalition-aware input perturbation).
         # Both target_marker_spatial (q_ϕ) and mask_token_spatial (r_ψ) start at
         # zero, so epoch 0 is identical to a standard ActorCVAE forward pass.
-        # Training will diverge q_ϕ and r_ψ to serve their distinct roles.
 
     def load_decoder_from_phase1(self, ckpt_path: str) -> None:
         """Overwrite decoder weights from a Phase 1 Lightning checkpoint.
@@ -693,9 +832,9 @@ if __name__ == "__main__":
     assert "mu_full"    in out, "mu_full missing from phase 2 output"
     assert "mu_masked"  in out, "mu_masked missing from phase 2 output"
 
-    loss, ld = model.compute_loss(out, lambda_kl=1.0, lambda_reg=1e-6)
+    loss, ld = model.compute_loss(out, lambda_kl=1.0, lambda_reg=1e-6, lambda_vel=5.0)
     assert loss.isfinite(), f"Phase 2 loss not finite: {loss}"
-    assert set(ld.keys()) == {"rc", "kl", "reg", "mixed"}, \
+    assert set(ld.keys()) == {"rc", "rc_obs", "rc_psi", "vel", "kl", "reg", "kl_full", "mixed"}, \
         f"Unexpected loss keys: {ld.keys()}"
 
     # Verify forward KL direction: KL(q_ϕ || r_ψ), not KL(r_ψ || q_ϕ).

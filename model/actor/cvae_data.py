@@ -34,6 +34,7 @@ import os
 import torch
 from const import path
 from data.dataloaders import dataset_factory
+from model.actor.motion_utils import root_with_global_pelvis
 
 _SUPPORTED = ["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait"]
 
@@ -214,34 +215,57 @@ def actor_batch_from_carepd(
     num_classes: int,
     device: torch.device,
     y: torch.Tensor | None = None,
+    root_centered: bool = False,
+    world_coords: bool = False,
 ) -> dict:
     """Convert H36M XYZ batch ``(B, T, J, 3)`` to ACTOR batch dict.
 
-    The raw CARE-PD H36M data is in absolute world coordinates (the person
-    walks forward through space).  We root-centre every frame by subtracting
-    joint 0 (pelvis), matching ACTOR's treatment of XYZ data.  Without this,
-    the rc loss is dominated by the global translation and the model collapses
-    to the mean pose (skeleton "glides" forward without any gait oscillation).
+    By default the data is stored in the *global-pelvis* representation:
+
+      - Joint 0 (pelvis) retains its absolute world-space position.
+      - Joints 1–16 are expressed relative to the pelvis at each frame.
+
+    This lets the model learn local body shape (joints 1–16) separately from
+    global trajectory (joint 0).  Full global 3D can be recovered at any time
+    with ``model.actor.motion_utils.unroot_to_global``.
+
+    Set ``root_centered=True`` (used by baselines) to instead subtract the
+    pelvis from **all** joints, fixing it to the origin each frame.
+
+    Set ``world_coords=True`` (legacy mode) to keep all joints in raw
+    world-space coordinates — no transformation applied.  Use this when
+    loading checkpoints trained before the global-pelvis representation was
+    introduced.
 
     Args:
-        x_bttf:    ``(B, T, J, F)`` float tensor from the H36M data loader.
-        pad_mask:  ``(B, T)`` bool mask, True = valid (non-padded) frame.
-        num_classes: unused; kept for API compatibility.
-        device:    target device.
-        y:         optional ``(B,)`` int64 class label tensor (e.g. UPDRS score).
-                   If None, defaults to all-zeros (single-class mode).
+        x_bttf:        ``(B, T, J, F)`` float tensor from the H36M data loader.
+        pad_mask:      ``(B, T)`` bool mask, True = valid (non-padded) frame.
+        num_classes:   unused; kept for API compatibility.
+        device:        target device.
+        y:             optional ``(B,)`` int64 class label tensor.
+                       If None, defaults to all-zeros (single-class mode).
+        root_centered: if True, subtract joint-0 (pelvis) from all joints so
+                       the root is fixed at the origin each frame.  Overrides
+                       the default global-pelvis representation.
+        world_coords:  if True, keep raw world-space coordinates (legacy).
+                       Ignored when root_centered=True.
 
     Returns:
         dict with keys ``x``, ``y``, ``mask``, ``lengths`` per ACTOR convention.
-        ``x`` has shape ``(B, 17, 3, T)`` in root-centred coordinates.
+        ``x`` has shape ``(B, 17, 3, T)``.
     """
     b, t, j, f = x_bttf.shape
     x_bttf = x_bttf.to(device)
     pad_mask = pad_mask.bool().to(device)
 
-    # Root-centre: subtract pelvis (joint 0) from every joint every frame.
-    # x_bttf[:, :, 0:1, :] has shape (B, T, 1, 3) — broadcasts over J.
-    x_bttf = x_bttf - x_bttf[:, :, 0:1, :]
+    if root_centered:
+        # Baseline path: fix pelvis at world origin every frame.
+        x_bttf = x_bttf - x_bttf[:, :, 0:1, :]
+    elif not world_coords:
+        # Default: global-pelvis representation — keep pelvis in world space,
+        # relativize all other joints with respect to it.
+        x_bttf = root_with_global_pelvis(x_bttf)
+    # else world_coords=True: pass raw world-space coords unchanged (legacy).
 
     if y is None:
         y_out = torch.zeros(b, dtype=torch.long, device=device)
