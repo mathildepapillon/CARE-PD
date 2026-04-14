@@ -567,6 +567,12 @@ def main() -> None:
     )
     trainer.fit(module, train_loader, val_loader)
 
+    # Explicitly save a final checkpoint so evaluate_shap_synthetic.py always
+    # finds one, regardless of make_trainer's every_n_epochs trigger.
+    final_ckpt = os.path.join(ckpt_dir, "actor_shap_synthetic_last.ckpt")
+    trainer.save_checkpoint(final_ckpt)
+    print(f"\n[SyntheticTrain] Saved final checkpoint: {final_ckpt}")
+
     print(f"\n[SyntheticTrain] Done.")
     print(f"  Checkpoint dir: {ckpt_dir}")
     print(f"  Evaluate with:")

@@ -115,11 +115,18 @@ def load_actor_shap(ckpt_dir: str, device: torch.device) -> ActorSHAP:
 
     ckpt_path = os.path.join(ckpt_dir, "actor_shap_synthetic_last.ckpt")
     if not os.path.exists(ckpt_path):
-        # Fallback: find any .ckpt file.
-        ckpts = [f for f in os.listdir(ckpt_dir) if f.endswith(".ckpt")]
+        # Fallback: find any .ckpt file, prefer the most recently modified one.
+        ckpts = [
+            os.path.join(ckpt_dir, f)
+            for f in os.listdir(ckpt_dir)
+            if f.endswith(".ckpt")
+        ]
         if not ckpts:
-            raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
-        ckpt_path = os.path.join(ckpt_dir, sorted(ckpts)[-1])
+            raise FileNotFoundError(
+                f"No checkpoint found in {ckpt_dir}\n"
+                "Make sure training completed (check logs for 'Saved final checkpoint')."
+            )
+        ckpt_path = max(ckpts, key=os.path.getmtime)
     print(f"[Load] ActorSHAP ← {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
