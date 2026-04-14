@@ -69,6 +69,7 @@ from model.actor.shap_metrics import (
     compute_shapley_completeness,
     compute_spatial_faithfulness_batched,
 )
+from model.actor.physics_completer import PhysicsInformedCompleter, load_physics_completer
 from model.motion_encoder import MotionEncoder
 
 # Shared utilities (backbone param loading, data helpers, classifier wrapper,
@@ -103,18 +104,26 @@ def evaluate_sequence(
     zscore_mean: Optional[torch.Tensor],
     zscore_std: Optional[torch.Tensor],
     cfg: dict,
+    physics_completer: Optional[PhysicsInformedCompleter] = None,
+    subject_id: Optional[str] = None,
+    physics_cache_record: Optional[dict] = None,
 ) -> dict:
-    """Run spatial and temporal SHAP (all three baselines) for one sequence."""
+    """Run spatial and temporal SHAP (all baselines) for one sequence."""
     device        = x.device
     n_kernel      = cfg.get('n_kernel_samples', 3000)
     n_completions = cfg.get('n_completion_samples', 20)
     k_list        = tuple(cfg.get('k_list', [1, 2, 3, 5]))
     fps           = cfg.get('fps', 30)
+    physics_n_kernel   = cfg.get('physics_n_kernel_samples', 500)
+    physics_n_samples  = cfg.get('physics_n_samples', 5)
 
     classifier_fn = build_classifier_fn(
         motion_encoder, mask, backbone_name,
         zscore_mean=zscore_mean, zscore_std=zscore_std,
     )
+
+    if physics_completer is not None and subject_id is not None:
+        physics_completer.set_subject(subject_id)
 
     # ------------------------------------------------------------------
     # Spatial SHAP (KernelSHAP, ~3000 coalitions over 17 joints)
@@ -154,6 +163,30 @@ def evaluate_sequence(
         train_pool=train_pool, n_samples=n_completions,
         k_list=k_list, p_full=p_full, p_ref=p_ref_marg, seq_idx=seq_idx,
     )
+
+    if physics_cache_record is not None:
+        # Fast path: pre-computed results loaded from disk.
+        shap_physics    = physics_cache_record['shap_values']
+        metrics_physics = physics_cache_record['faithfulness']
+    elif physics_completer is not None:
+        # Live path: run KernelSHAP + faithfulness now (slow).
+        print(f'  [seq {seq_idx}] spatial SHAP (physics) …')
+        shap_physics = compute_spatial_shap_baseline(
+            'physics', classifier_fn, x, y, mask, lengths,
+            physics_completer=physics_completer,
+            n_kernel_samples=physics_n_kernel,
+            n_marginal_samples=physics_n_samples,
+            seed=seq_idx,
+        )
+        p_ref_phys = shap_physics['_v_empty']
+        metrics_physics = compute_spatial_faithfulness_batched(
+            classifier_fn, x, y, mask, lengths, shap_physics, 'physics',
+            physics_completer=physics_completer, n_samples=physics_n_samples,
+            k_list=k_list, p_full=p_full, p_ref=p_ref_phys, seq_idx=seq_idx,
+        )
+    else:
+        shap_physics    = None
+        metrics_physics = None
 
     # ------------------------------------------------------------------
     # Temporal SHAP (exact enumeration, K=4 stride-aligned windows)
@@ -205,22 +238,28 @@ def evaluate_sequence(
             'completeness_error': comp_err,
         }
 
+    shap_vals: dict[str, dict] = {
+        'zero':     {k: float(v) for k, v in shap_zero.items()},
+        'mean':     {k: float(v) for k, v in shap_mean.items()},
+        'marginal': {k: float(v) for k, v in shap_marginal.items()},
+    }
+    faithfulness: dict[str, dict] = {
+        'zero':     metrics_zero,
+        'mean':     metrics_mean,
+        'marginal': metrics_marginal,
+    }
+    if shap_physics is not None:
+        shap_vals['physics']    = {k: float(v) for k, v in shap_physics.items()}
+        faithfulness['physics'] = metrics_physics
+
     return {
         'seq_idx':    seq_idx,
         'true_class': int(y[0].item()),
         'p_full':     p_full,
         'stride_detected': not fallback,
         # Spatial
-        'shap_values': {
-            'zero':     {k: float(v) for k, v in shap_zero.items()},
-            'mean':     {k: float(v) for k, v in shap_mean.items()},
-            'marginal': {k: float(v) for k, v in shap_marginal.items()},
-        },
-        'faithfulness': {
-            'zero':     metrics_zero,
-            'mean':     metrics_mean,
-            'marginal': metrics_marginal,
-        },
+        'shap_values':   shap_vals,
+        'faithfulness':  faithfulness,
         # Temporal
         'temporal_shap_values': {
             'zero':     {k: float(v) for k, v in t_shap_zero.items()},
@@ -240,13 +279,21 @@ _BASELINE_METHODS = ('zero', 'mean', 'marginal')
 
 def aggregate_results(per_seq: list[dict]) -> dict:
     agg: dict[str, list[float]] = defaultdict(list)
+
+    # Detect which spatial methods are present (always includes zero/mean/marginal,
+    # optionally includes physics when --physics_stats was provided).
+    spatial_methods = list(per_seq[0]['faithfulness'].keys()) if per_seq else list(_BASELINE_METHODS)
+    temporal_methods = list(_BASELINE_METHODS)
+
     for r in per_seq:
         agg['p_full'].append(r['p_full'])
         agg['stride_detected'].append(float(r.get('stride_detected', True)))
 
         # Spatial faithfulness
-        for method in _BASELINE_METHODS:
-            f      = r['faithfulness'][method]
+        for method in spatial_methods:
+            f = r['faithfulness'].get(method)
+            if f is None:
+                continue
             prefix = f'spatial/{method}'
             agg[f'{prefix}/deletion_auc'].append(f['deletion_auc'])
             agg[f'{prefix}/insertion_auc'].append(f['insertion_auc'])
@@ -260,8 +307,8 @@ def aggregate_results(per_seq: list[dict]) -> dict:
                 agg[f'{prefix}/pgi_rand@{k}'].append(vals['pgi'])
                 agg[f'{prefix}/pgu_rand@{k}'].append(vals['pgu'])
 
-        # Temporal faithfulness
-        for method in _BASELINE_METHODS:
+        # Temporal faithfulness (zero/mean/marginal only)
+        for method in temporal_methods:
             tf     = r.get('temporal_faithfulness', {}).get(method, {})
             prefix = f'temporal/{method}'
             for key in ('deletion_auc', 'insertion_auc', 'completeness_error'):
@@ -334,15 +381,36 @@ def main() -> None:
     parser.add_argument('--root_centered', action='store_true', default=False,
                         help='Subtract joint-0 (pelvis) so sequences are root-centred. '
                              'Default: absolute world coordinates (no root-centering).')
+    # Physics-informed baseline (optional — two mutually exclusive modes)
+    parser.add_argument('--physics_stats', default=None,
+                        help='Path to motion_stats_fold*.pkl from compute_motion_stats.py. '
+                             'Runs physics SHAP live (slow). Mutually exclusive with '
+                             '--physics_cache_dir.')
+    parser.add_argument('--physics_cache_dir', default=None,
+                        help='Directory of pre-computed JSON files from '
+                             'scripts/precompute_physics_shap.py. '
+                             'Loads results instantly — no completer needed. '
+                             'Mutually exclusive with --physics_stats.')
+    parser.add_argument('--physics_n_kernel_samples', type=int, default=500,
+                        help='KernelSHAP coalition pairs for the physics method '
+                             '(only used with --physics_stats, not --physics_cache_dir).')
+    parser.add_argument('--physics_n_samples', type=int, default=5,
+                        help='Physics completions averaged per coalition '
+                             '(only used with --physics_stats).')
     args = parser.parse_args()
+
+    if args.physics_stats and args.physics_cache_dir:
+        parser.error("--physics_stats and --physics_cache_dir are mutually exclusive.")
 
     device = torch.device(args.device)
 
     cfg = {
-        'n_kernel_samples':    args.n_kernel_samples,
-        'n_completion_samples': args.n_completion_samples,
-        'k_list':              args.k_list,
-        'fps':                 args.fps,
+        'n_kernel_samples':        args.n_kernel_samples,
+        'n_completion_samples':    args.n_completion_samples,
+        'k_list':                  args.k_list,
+        'fps':                     args.fps,
+        'physics_n_kernel_samples': args.physics_n_kernel_samples,
+        'physics_n_samples':        args.physics_n_samples,
     }
 
     # ------------------------------------------------------------------
@@ -386,6 +454,25 @@ def main() -> None:
     else:
         zscore_mean = zscore_std = None
 
+    # Physics completer — live mode (--physics_stats) or cache mode (--physics_cache_dir).
+    physics_completer = None
+    physics_cache: dict[int, dict] = {}   # seq_idx → pre-loaded record
+
+    if args.physics_stats:
+        print(f'  Loading PhysicsInformedCompleter from {args.physics_stats} …')
+        physics_completer = load_physics_completer(args.physics_stats, device)
+        print(f'  physics baseline: n_kernel={args.physics_n_kernel_samples}  '
+              f'n_samples={args.physics_n_samples}')
+    elif args.physics_cache_dir:
+        import glob as _glob, json as _json
+        cache_files = sorted(_glob.glob(os.path.join(args.physics_cache_dir, 'seq_*.json')))
+        for cf in cache_files:
+            with open(cf) as fh:
+                rec = _json.load(fh)
+            physics_cache[rec['seq_idx']] = rec
+        print(f'  Loaded {len(physics_cache)} pre-computed physics records '
+              f'from {args.physics_cache_dir}')
+
     # ------------------------------------------------------------------
     # Load test data (same raw pipeline).
     # ------------------------------------------------------------------
@@ -414,27 +501,40 @@ def main() -> None:
             x_raw.float(), pad_mask, backbone_params['num_classes'], device,
             y=labels, root_centered=args.root_centered,
         )
-        x       = batch['x']        # (1, J, F, T) root-centred
+        x       = batch['x']        # (1, J, F, T)
         y       = batch['y']        # (1,)
         mask    = batch['mask']     # (1, T)
         lengths = batch['lengths']  # (1,)
+
+        # Physics: either live completer or pre-loaded cache record.
+        subject_id: Optional[str] = None
+        if physics_completer is not None:
+            video_name = test_ds.video_names[seq_idx]
+            subject_id = video_name.split('__')[0]
 
         result = evaluate_sequence(
             seq_idx, x, y, mask, lengths,
             motion_encoder, backbone_name, train_pool, joint_means,
             zscore_mean, zscore_std, cfg,
+            physics_completer=physics_completer,
+            subject_id=subject_id,
+            physics_cache_record=physics_cache.get(seq_idx),
         )
         per_seq_results.append(result)
 
         with open(jsonl_path, 'a') as fh:
             fh.write(json.dumps(result) + '\n')
 
+        phys_str = ''
+        if 'physics' in result['faithfulness']:
+            phys_str = f' phys={result["faithfulness"]["physics"]["deletion_auc"]:.3f}'
         print(
             f'  seq {seq_idx}: class={result["true_class"]} '
             f'p_full={result["p_full"]:.3f}  '
             f'del_auc  zero={result["faithfulness"]["zero"]["deletion_auc"]:.3f} '
             f'mean={result["faithfulness"]["mean"]["deletion_auc"]:.3f} '
-            f'marg={result["faithfulness"]["marginal"]["deletion_auc"]:.3f}',
+            f'marg={result["faithfulness"]["marginal"]["deletion_auc"]:.3f}'
+            f'{phys_str}',
             flush=True,
         )
 
@@ -447,19 +547,24 @@ def main() -> None:
 
     agg = aggregate_results(per_seq_results)
     agg['_meta'] = {
-        'backbone':            args.backbone,
-        'dataset':             backbone_params['dataset'],
-        'config':              args.config,
-        'num_folds':           args.num_folds,
-        'fold':                args.fold,
-        'n_test_sequences':    len(per_seq_results),
-        'n_kernel_samples':    args.n_kernel_samples,
-        'n_completion_samples': args.n_completion_samples,
-        'k_list':              args.k_list,
-        'fps':                 args.fps,
-        'classifier_ckpt':     args.classifier_ckpt,
-        'output_dir':          output_dir,
-        'p_full_warning':      p_full_warning,
+        'backbone':                 args.backbone,
+        'dataset':                  backbone_params['dataset'],
+        'config':                   args.config,
+        'num_folds':                args.num_folds,
+        'fold':                     args.fold,
+        'n_test_sequences':         len(per_seq_results),
+        'n_kernel_samples':         args.n_kernel_samples,
+        'n_completion_samples':     args.n_completion_samples,
+        'k_list':                   args.k_list,
+        'fps':                      args.fps,
+        'classifier_ckpt':          args.classifier_ckpt,
+        'output_dir':               output_dir,
+        'p_full_warning':           p_full_warning,
+        'physics_stats':            args.physics_stats,
+        'physics_cache_dir':        args.physics_cache_dir,
+        'physics_n_kernel_samples': args.physics_n_kernel_samples,
+        'physics_n_samples':        args.physics_n_samples,
+        'physics_sequences_cached': len(physics_cache),
     }
     with open(os.path.join(output_dir, 'aggregate.json'), 'w') as fh:
         json.dump(agg, fh, indent=2)
@@ -477,10 +582,13 @@ def main() -> None:
         return e.get('mean', float('nan')), e.get('std', float('nan'))
 
     # --- Spatial SHAP ---
+    spatial_methods_present = list(
+        dict.fromkeys(list(_BASELINE_METHODS) + (['physics'] if physics_completer else []))
+    )
     print('  Spatial SHAP (KernelSHAP, 17 joints):')
     print(f'  {"Method":<10}  {"Del-AUC":>10}  {"Ins-AUC":>10}  {"PGI@1":>8}  {"PGU@1":>8}  {"Comp.Err":>10}')
     print(f'  {"-"*10}  {"-"*10}  {"-"*10}  {"-"*8}  {"-"*8}  {"-"*10}')
-    for method in _BASELINE_METHODS:
+    for method in spatial_methods_present:
         dm, ds = _get(f'spatial/{method}/deletion_auc')
         im, is_ = _get(f'spatial/{method}/insertion_auc')
         pm, _ = _get(f'spatial/{method}/pgi@1')

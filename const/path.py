@@ -280,6 +280,17 @@ POSE_AND_LABEL = {
             'PATH_LABELS': f'{PROJECT_ROOT}/assets/datasets/T-LDU.pkl'
         }
     },
+
+    'H36M': {
+        'h36m': {
+            'PATH_POSES': {
+                '3D': {
+                    'preprocessed': f'{PROJECT_ROOT}/assets/datasets/h36m/H36M/h36m_3d_world_floorXZZplus_30f_or_longer.npz',
+                }
+            },
+            'PATH_LABELS': f'{PROJECT_ROOT}/assets/datasets/H36M.pkl'
+        },
+    },
 }
 
 PRETRAINEDD_MODEL_CHECKPOINTS_ROOT_PATH = f'{PROJECT_ROOT}/assets/Pretrained_checkpoints'

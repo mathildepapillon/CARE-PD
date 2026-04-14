@@ -36,7 +36,7 @@ from const import path
 from data.dataloaders import dataset_factory
 from model.actor.motion_utils import root_with_global_pelvis
 
-_SUPPORTED = ["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait"]
+_SUPPORTED = ["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait", "H36M"]
 
 # Number of valid SMPL joints in our 6D_SMPL data (drop the zero-padding joint).
 SMPL_NJOINTS = 24
@@ -54,7 +54,12 @@ def build_motionclip_params(
 ):
     """Return a param dict for the H36M (XYZ) data loader — the legacy path."""
     pose_default = path.POSE_AND_LABEL[dataset_name]["h36m"]["PATH_POSES"]["3D"]["preprocessed"]
-    labels_default = path.POSE_AND_LABEL[dataset_name]["6DSMPL"]["PATH_LABELS"]
+    ds_entry = path.POSE_AND_LABEL[dataset_name]
+    labels_default = (
+        ds_entry["6DSMPL"]["PATH_LABELS"]
+        if "6DSMPL" in ds_entry
+        else ds_entry["h36m"]["PATH_LABELS"]
+    )
     return {
         "backbone": "motionclip",
         "dataset": dataset_name,

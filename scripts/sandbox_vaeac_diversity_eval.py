@@ -44,8 +44,14 @@ if _ROOT not in sys.path:
 
 from data.dataloaders import collate_fn
 from model.actor.cvae_data import actor_batch_from_carepd, get_carepd_datasets
+from model.actor.physics_completer import PhysicsInformedCompleter, load_physics_completer
 from model.actor.shap_masking import H36M_GROUPS, H36M_JOINT_NAMES
 from model.actor.transformer_arch import Decoder_TRANSFORMER
+from model.actor.vaeac_actor_motion import (
+    VaeacActorFullEncoder,
+    VaeacActorMaskedEncoder,
+    VaeacActorMotion,
+)
 from model.actor.vaeac_motion import VaeacFullEncoder, VaeacMaskedEncoder, VaeacMotion
 
 
@@ -53,9 +59,16 @@ from model.actor.vaeac_motion import VaeacFullEncoder, VaeacMaskedEncoder, Vaeac
 # Model loading
 # ---------------------------------------------------------------------------
 
-def _find_latest_ckpt(base_dir: str, fold: int) -> str | None:
+def _find_latest_ckpt(
+    base_dir: str,
+    fold: int,
+    dataset: str = "BMCLab",
+    model_type: str = "vaeac",
+) -> str | None:
+    """Find the most recently saved *_last.ckpt under base_dir."""
+    prefix = "vaeac_actor_motion" if model_type == "vaeac_actor" else "vaeac_motion"
     pattern = os.path.join(
-        base_dir, f"vaeac_motion_BMCLab_fold{fold}_*", "vaeac_motion_last.ckpt"
+        base_dir, f"{prefix}_{dataset}_fold{fold}_*", f"{prefix}_last.ckpt"
     )
     hits = sorted(glob.glob(pattern))
     return hits[-1] if hits else None
@@ -84,15 +97,40 @@ def load_vaeac_from_ckpt(ckpt_path: str, device: torch.device) -> VaeacMotion:
     dropout     = float(cfg.get("dropout",   0.1))
     num_classes = int(cfg.get("num_classes", 3))
 
-    # Auto-detect whether this is a legacy checkpoint (no binary indicator in
-    # observed_projection).  J*F = 17*3 = 51 → legacy; J*F+J = 68 → current.
     raw = torch.load(ckpt_path, map_location=device)
     sd  = raw.get("state_dict", raw)
     sd  = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in sd.items()}
-    proj_in = sd["observed_projection.weight"].shape[1]  # 51 (legacy) or 68 (current)
-    use_obs_indicator = (proj_in != 17 * 3)
-    if not use_obs_indicator:
-        print("[load] legacy checkpoint detected (observed_projection input=51, no indicator)")
+
+    # Auto-detect architecture variant from state-dict keys/shapes.
+    #
+    # Plain Linear:      "observed_projection.weight"   shape (D, proj_in)
+    # Bottleneck MLP:    "observed_projection.0.weight" shape (bottleneck, proj_in)
+    #                    "observed_projection.2.weight" shape (D, bottleneck)
+    # Legacy (no ind.):  plain linear with proj_in == 51  (J*F only)
+    # z-only (no obs):   plain linear with shape (1, 1) — dummy placeholder
+    if "observed_projection.weight" in sd:
+        proj_in           = sd["observed_projection.weight"].shape[1]
+        # A (1, 1) dummy weight means use_obs_emb=False (z-only / standard VAEAC).
+        if proj_in == 1 and sd["observed_projection.weight"].shape[0] == 1:
+            use_obs_emb       = False
+            use_obs_indicator = True   # irrelevant, obs_emb not used
+            obs_emb_bottleneck = 0
+            print("[load] z-only checkpoint detected (use_obs_emb=False, standard VAEAC)")
+        else:
+            use_obs_emb       = True
+            use_obs_indicator = proj_in != 17 * 3   # 51=legacy, 68=current
+            obs_emb_bottleneck = 0
+            if not use_obs_indicator:
+                print("[load] legacy checkpoint detected (observed_projection input=51, no indicator)")
+    elif "observed_projection.0.weight" in sd:
+        proj_in            = sd["observed_projection.0.weight"].shape[1]
+        obs_emb_bottleneck = sd["observed_projection.0.weight"].shape[0]
+        use_obs_indicator  = proj_in != 17 * 3
+        use_obs_emb        = True
+        print(f"[load] Mod A checkpoint: bottleneck={obs_emb_bottleneck}, "
+              f"proj_in={proj_in}, use_obs_indicator={use_obs_indicator}")
+    else:
+        raise KeyError("Cannot find observed_projection keys in checkpoint state dict.")
 
     common = dict(
         modeltype="cvae",
@@ -115,12 +153,69 @@ def load_vaeac_from_ckpt(ckpt_path: str, device: torch.device) -> VaeacMotion:
         pose_rep="xyz",
         num_classes=num_classes,
         use_obs_indicator=use_obs_indicator,
+        obs_emb_bottleneck=obs_emb_bottleneck,
+        use_obs_emb=use_obs_emb,
     )
 
     model.load_state_dict(sd, strict=True)
     model.to(device).eval()
     print(f"[load] loaded VaeacMotion from {ckpt_path}  "
-          f"(use_obs_indicator={use_obs_indicator})")
+          f"(use_obs_indicator={use_obs_indicator}, "
+          f"obs_emb_bottleneck={obs_emb_bottleneck})")
+    return model
+
+
+def load_vaeac_actor_from_ckpt(ckpt_path: str, device: torch.device) -> VaeacActorMotion:
+    """Rebuild VaeacActorMotion from a Lightning checkpoint saved by train_vaeac_actor_motion.py.
+
+    Architecture parameters are read from the config.json saved alongside the
+    checkpoint (written automatically by train_vaeac_actor_motion.py).
+    """
+    ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path))
+    cfg_path = os.path.join(ckpt_dir, "config.json")
+    cfg: dict = {}
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    else:
+        print(f"[WARNING] no config.json found next to {ckpt_path}; using defaults.")
+
+    latent_dim  = int(cfg.get("latent_dim",  256))
+    ff_size     = int(cfg.get("ff_size",     1024))
+    num_layers  = int(cfg.get("num_layers",  8))
+    num_heads   = int(cfg.get("num_heads",   4))
+    dropout     = float(cfg.get("dropout",   0.1))
+    num_classes = int(cfg.get("num_classes", 3))
+
+    common = dict(
+        modeltype="cvae",
+        njoints=17, nfeats=3,
+        num_frames=0, num_classes=num_classes,
+        translation=True, pose_rep="xyz",
+        glob=True, glob_rot=[3.141592653589793, 0, 0],
+        latent_dim=latent_dim, ff_size=ff_size,
+        num_layers=num_layers, num_heads=num_heads,
+        dropout=dropout, ablation=None, activation="gelu",
+    )
+
+    model = VaeacActorMotion(
+        VaeacActorFullEncoder(**common),
+        VaeacActorMaskedEncoder(**common),
+        Decoder_TRANSFORMER(**common),
+        latent_dim=latent_dim,
+        njoints=17, nfeats=3,
+        device=device,
+        pose_rep="xyz",
+        num_classes=num_classes,
+    )
+
+    raw = torch.load(ckpt_path, map_location=device)
+    sd  = raw.get("state_dict", raw)
+    sd  = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in sd.items()}
+    model.load_state_dict(sd, strict=True)
+    model.to(device).eval()
+    print(f"[load] loaded VaeacActorMotion from {ckpt_path}  "
+          f"(latent_dim={latent_dim}, num_layers={num_layers})")
     return model
 
 
@@ -246,7 +341,11 @@ def eval_coalition(
     for x_hat in completions:
         out = model.full_encoder({"x": x_hat, "y": y, "mask": mask,
                                   "coalition_mask": full_cm})
-        enc_mus.append(out["mu_full"].squeeze(0).cpu().numpy())
+        mu = out["mu_full"]
+        # VaeacActorMotion: mu is (T, B, D); mean-pool over T for a D-dim summary.
+        if mu.dim() == 3:
+            mu = mu.mean(0)        # (B, D)
+        enc_mus.append(mu.squeeze(0).cpu().numpy())
     if K < 2:
         diversity_enc = 0.0
     else:
@@ -267,6 +366,68 @@ def eval_coalition(
     }
 
 
+@torch.no_grad()
+def eval_coalition_physics(
+    model: PhysicsInformedCompleter,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    lengths: torch.Tensor,
+    coalition_mask: torch.Tensor,
+    n_samples: int = 20,
+    subject_id: str | None = None,
+) -> dict[str, float]:
+    """Like eval_coalition but for PhysicsInformedCompleter (no encoder diversity)."""
+    B, J, F, T = x.shape
+    device = x.device
+
+    if subject_id:
+        model.set_subject(subject_id)
+    completions = model.sample_completions(
+        x, y, mask, lengths, coalition_mask,
+        n_samples=n_samples, paste_observed=True,
+    )
+    K = len(completions)
+
+    held_out = ~coalition_mask.unsqueeze(2).unsqueeze(3).expand(B, J, F, T)
+    obs_mask  = coalition_mask.unsqueeze(2).unsqueeze(3).expand(B, J, F, T)
+    real      = mask.unsqueeze(1).unsqueeze(1).expand(B, J, F, T)
+
+    held_real = (held_out & real).float()
+    obs_real  = (obs_mask  & real).float()
+    n_held    = held_real.sum().clamp(min=1.0)
+    n_obs     = obs_real.sum().clamp(min=1.0)
+
+    masked_mse_list, obs_mse_list = [], []
+    for x_hat in completions:
+        diff_sq = (x_hat - x).pow(2)
+        masked_mse_list.append(float((diff_sq * held_real).sum() / n_held))
+        obs_mse_list.append(float((diff_sq * obs_real).sum() / n_obs))
+    masked_rmse = float(np.sqrt(np.mean(masked_mse_list)))
+    obs_rmse    = float(np.sqrt(np.mean(obs_mse_list)))
+
+    if K < 2:
+        diversity_raw = 0.0
+    else:
+        stacked = torch.stack(completions, dim=0).squeeze(1)  # (K, J, F, T)
+        mask_expand = held_real[0]
+        n_elem = mask_expand.sum().clamp(min=1.0)
+        pairwise: list[float] = []
+        for i in range(K):
+            for j in range(i + 1, K):
+                diff = ((stacked[i] - stacked[j]).pow(2) * mask_expand).sum() / n_elem
+                pairwise.append(float(diff.sqrt()))
+        diversity_raw = float(np.mean(pairwise)) if pairwise else 0.0
+
+    return {
+        "masked_rmse":    masked_rmse,
+        "obs_rmse":       obs_rmse,
+        "diversity_raw":  diversity_raw,
+        "diversity_enc":  float("nan"),   # not applicable for physics model
+        "div_over_rmse":  diversity_raw / max(masked_rmse, 1e-6),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Printing helpers (shared between single-process and merge paths)
 # ---------------------------------------------------------------------------
@@ -278,10 +439,11 @@ def _print_table(
     n_seq: int,
     n_samples: int,
     ckpt_path: str,
+    model_label: str = "VaeacMotion",
 ) -> None:
     print("\n" + "=" * 110)
-    print(f"VaeacMotion — diversity vs fidelity  ({n_seq} seqs, K={n_samples} completions)")
-    print(f"checkpoint: {ckpt_path}")
+    print(f"{model_label} — diversity vs fidelity  ({n_seq} seqs, K={n_samples} completions)")
+    print(f"checkpoint / stats: {ckpt_path}")
     print("=" * 110)
 
     print("\n--- Anatomical group masks (1 group held out) ---")
@@ -388,22 +550,35 @@ def _print_table(
 
 def _parse_args():
     ap = argparse.ArgumentParser(
-        description="Evaluate VaeacMotion diversity vs fidelity across spatial coalitions.",
+        description="Evaluate VaeacMotion / PhysicsInformedCompleter diversity vs fidelity.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    ap.add_argument("--model_type", default="vaeac",
+                    choices=["vaeac", "vaeac_actor"],
+                    help="Model architecture to load. "
+                         "'vaeac' = VaeacMotion (single D-vector latent, default). "
+                         "'vaeac_actor' = VaeacActorMotion (per-frame T×D latent).")
     ap.add_argument("--ckpt", default=None,
-                    help="Path to vaeac_motion_last.ckpt (auto-detected if omitted).")
+                    help="Path to *_last.ckpt (auto-detected if omitted). "
+                         "Ignored when --physics_stats is given.")
     ap.add_argument("--ckpt_base_dir", default="./experiment_outs/vaeac_motion",
-                    help="Base dir to search for checkpoints when --ckpt is omitted.")
+                    help="Base dir to search for checkpoints when --ckpt is omitted. "
+                         "For --model_type vaeac_actor, set to "
+                         "./experiment_outs/vaeac_actor_motion.")
     ap.add_argument("--fold",      type=int, default=1)
     ap.add_argument("--num_folds", type=int, default=23)
-    ap.add_argument("--dataset",   default="BMCLab")
+    ap.add_argument("--dataset",   default="BMCLab",
+                    choices=["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait", "H36M"])
     ap.add_argument("--n_seq",     type=int, default=15,
                     help="Total number of test sequences to evaluate (across all workers).")
     ap.add_argument("--n_samples", type=int, default=20,
                     help="Stochastic completions per coalition per sequence.")
     ap.add_argument("--device",    default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed",      type=int, default=0)
+    # ---- physics completer --------------------------------------------------
+    ap.add_argument("--physics_stats", default=None,
+                    help="Path to motion_stats_fold*.pkl produced by compute_motion_stats.py. "
+                         "When set, uses PhysicsInformedCompleter instead of VaeacMotion.")
     # ---- parallel sharding --------------------------------------------------
     ap.add_argument("--num_workers", type=int, default=1,
                     help="Total number of parallel worker processes.")
@@ -421,7 +596,11 @@ def _parse_args():
 def _resolve_ckpt(args) -> str:
     ckpt_path = args.ckpt
     if ckpt_path is None:
-        ckpt_path = _find_latest_ckpt(args.ckpt_base_dir, args.fold)
+        model_type = getattr(args, "model_type", "vaeac")
+        ckpt_path = _find_latest_ckpt(
+            args.ckpt_base_dir, args.fold,
+            dataset=args.dataset, model_type=model_type,
+        )
         if ckpt_path is None:
             raise SystemExit(
                 f"No checkpoint found under {args.ckpt_base_dir}. "
@@ -442,7 +621,10 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    ckpt_path   = _resolve_ckpt(args)
+    if args.physics_stats:
+        ckpt_path = args.physics_stats
+    else:
+        ckpt_path = _resolve_ckpt(args)
     results_dir = _results_dir_for(ckpt_path, args.results_dir)
 
     # ------------------------------------------------------------------ merge
@@ -468,14 +650,34 @@ def main():
                     merged[cname].extend(rows)
             total_seqs += partial.get("n_seq_this_worker", 0)
 
+        model_label = ("PhysicsInformedCompleter" if args.physics_stats
+                       else "VaeacMotion")
         _print_table(merged, coa_meta, coalitions,
                      n_seq=total_seqs, n_samples=args.n_samples,
-                     ckpt_path=ckpt_path)
+                     ckpt_path=ckpt_path, model_label=model_label)
         return
 
     # --------------------------------------------------------- worker / single
     device = torch.device(args.device)
-    model  = load_vaeac_from_ckpt(ckpt_path, device)
+
+    # ----- decide which model to use ----------------------------------------
+    use_physics = bool(args.physics_stats)
+    if use_physics:
+        physics_model = load_physics_completer(args.physics_stats, device)
+        model_label = "PhysicsInformedCompleter"
+        # ckpt_path used only for results_dir naming; set to stats path
+        ckpt_path = args.physics_stats
+        num_classes = 3
+    else:
+        physics_model = None
+        model_type = getattr(args, "model_type", "vaeac")
+        if model_type == "vaeac_actor":
+            model = load_vaeac_actor_from_ckpt(ckpt_path, device)
+            model_label = "VaeacActorMotion"
+        else:
+            model = load_vaeac_from_ckpt(ckpt_path, device)
+            model_label = "VaeacMotion"
+        num_classes = model.num_classes
 
     class _DataArgs:
         dataset          = args.dataset
@@ -517,17 +719,34 @@ def main():
     coa_meta   = {c["name"]: {"n_held": c["n_held"]} for c in coalitions}
     results: dict[str, list[dict]] = {c["name"]: [] for c in coalitions}
 
-    for local_i, raw_batch in enumerate(loader):
-        x_raw, labels, _, _, pad_mask = raw_batch
+    for local_i, (raw_batch, ds_idx) in enumerate(
+        zip(loader, range(seq_start, seq_end))
+    ):
+        x_raw, labels, video_idxs, _, pad_mask = raw_batch
         b = actor_batch_from_carepd(
             x_raw.float().to(device), pad_mask.to(device),
-            model.num_classes, device, y=labels,
+            num_classes, device, y=labels,
         )
         x, y_t, mask_t, lengths = b["x"], b["y"], b["mask"], b["lengths"]
 
+        # Extract subject ID for physics completer (from video_names)
+        if use_physics:
+            video_name = test_ds.video_names[ds_idx]
+            subject_id = video_name.split("__")[0]
+        else:
+            subject_id = None
+
         for coa in coalitions:
-            m = eval_coalition(model, x, y_t, mask_t, lengths,
-                               coa["coalition_mask"], n_samples=args.n_samples)
+            if use_physics:
+                m = eval_coalition_physics(
+                    physics_model, x, y_t, mask_t, lengths,
+                    coa["coalition_mask"],
+                    n_samples=args.n_samples,
+                    subject_id=subject_id,
+                )
+            else:
+                m = eval_coalition(model, x, y_t, mask_t, lengths,
+                                   coa["coalition_mask"], n_samples=args.n_samples)
             results[coa["name"]].append(m)
 
         print(f"  seq {seq_start + local_i + 1}/{n_seq_total} done", flush=True)
@@ -552,10 +771,9 @@ def main():
               f"  python {os.path.relpath(__file__)} "
               f"--ckpt {ckpt_path} --results_dir {results_dir} --merge")
     else:
-
         _print_table(results, coa_meta, coalitions,
                      n_seq=n_seq_worker, n_samples=args.n_samples,
-                     ckpt_path=ckpt_path)
+                     ckpt_path=ckpt_path, model_label=model_label)
 
 
 if __name__ == "__main__":

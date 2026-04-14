@@ -126,7 +126,11 @@ class VaeacMaskedEncoder(nn.Module):
         for j in range(J):
             x[unobs[:, j], j, :, :] = self.mask_token_spatial[j, :].unsqueeze(-1)
         out = self._encoder({**batch, "x": x})
-        return {"mu_masked": out["mu"], "logvar_masked": out["logvar"]}
+        return {
+            "mu_masked": out["mu"],
+            "logvar_masked": out["logvar"],
+            "frame_tokens": out.get("frame_tokens"),  # (T, B, D) — passed through for Mod B
+        }
 
     def _encode_temporal(self, batch: dict) -> dict:
         x, y, mask = batch["x"], batch["y"], batch["mask"]
@@ -150,7 +154,11 @@ class VaeacMaskedEncoder(nn.Module):
         muandsigmaMask = torch.ones((B, 2), dtype=torch.bool, device=x.device)
         maskseq = torch.cat((muandsigmaMask, mask), dim=1)
         final = enc.seqTransEncoder(xseq, src_key_padding_mask=~maskseq)
-        return {"mu_masked": final[0], "logvar_masked": final[1]}
+        return {
+            "mu_masked": final[0],
+            "logvar_masked": final[1],
+            "frame_tokens": final[2:],  # (T, B, D) — passed through for Mod B
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +197,9 @@ class VaeacMotion(nn.Module):
         num_classes: int = 3,
         use_obs_indicator: bool = True,
         obs_emb_drop: float = 0.0,
+        obs_emb_bottleneck: int = 0,
+        use_masked_enc_memory: bool = False,
+        use_obs_emb: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -203,21 +214,53 @@ class VaeacMotion(nn.Module):
         self.device = device
         self.use_obs_indicator = use_obs_indicator
         self.obs_emb_drop = obs_emb_drop
+        self.obs_emb_bottleneck = obs_emb_bottleneck
+        self.use_masked_enc_memory = use_masked_enc_memory
+        self.use_obs_emb = use_obs_emb
 
         # Project raw observed features (+ optional binary coalition indicator)
         # to decoder latent space.
         #
-        # use_obs_indicator=True  (default, new checkpoints):
-        #   Input = [x_obs_flat | indicator], shape (J*F + J,).
-        #   Appending the indicator removes the ambiguity between
-        #   "joint coordinates happen to be zero" and "this joint is masked".
-        #   Follows Ivanov et al. (2019) §4.2: "concatenate [x◦(1−b), b]".
+        # use_obs_emb=False (standard VAEAC / z-only):
+        #   No observed_projection at all.  The decoder receives only z, exactly
+        #   as in the original ACTOR and standard VAEAC.  r_ψ encodes x_S into z
+        #   so the decoder can condition on x_S implicitly through z.  This is the
+        #   theoretically clean setting and removes the per-frame shortcut that
+        #   causes diversity collapse.  observed_projection is registered as a
+        #   dummy 1-parameter placeholder so checkpoint keys stay consistent.
         #
-        # use_obs_indicator=False (legacy checkpoints trained before the
-        #   indicator was added):
-        #   Input = x_obs_flat only, shape (J*F,).
-        obs_proj_in = njoints * nfeats + (njoints if use_obs_indicator else 0)
-        self.observed_projection = nn.Linear(obs_proj_in, latent_dim)
+        # use_obs_emb=True (default, legacy):
+        #   Per-frame observed features (zeroed at unobserved positions) are
+        #   projected to decoder latent space and prepended to the cross-attention
+        #   memory alongside z.
+        #
+        #   use_obs_indicator=True  (new checkpoints):
+        #     Input = [x_obs_flat | indicator], shape (J*F + J,).
+        #   use_obs_indicator=False (legacy checkpoints):
+        #     Input = x_obs_flat only, shape (J*F,).
+        #
+        #   obs_emb_bottleneck > 0 (Mod A): 2-layer MLP through a narrow
+        #     bottleneck forces lossy compression of the per-frame observation
+        #     signal so the decoder must rely on z for missing detail.
+        #
+        #   use_masked_enc_memory=True (Mod B): observed_projection is retained
+        #     for checkpoint compatibility but not used at runtime; the masked
+        #     encoder's own per-frame representations are used instead.
+        if not use_obs_emb:
+            # Dummy parameter — keeps the state-dict key present so that
+            # checkpoints saved with use_obs_emb=False can be loaded without
+            # strict=False hacks.
+            self.observed_projection = nn.Linear(1, 1, bias=False)
+        else:
+            obs_proj_in = njoints * nfeats + (njoints if use_obs_indicator else 0)
+            if obs_emb_bottleneck > 0:
+                self.observed_projection = nn.Sequential(
+                    nn.Linear(obs_proj_in, obs_emb_bottleneck),
+                    nn.GELU(),
+                    nn.Linear(obs_emb_bottleneck, latent_dim),
+                )
+            else:
+                self.observed_projection = nn.Linear(obs_proj_in, latent_dim)
 
         self.losses = ["rc", "vel", "kl", "reg", "mixed"]
 
@@ -305,61 +348,74 @@ class VaeacMotion(nn.Module):
         """VAEAC forward pass.
 
         phase="train":
-            q_ϕ → z ~ q_ϕ → decoder(z, x_S).  Also runs r_ψ for KL.
+            q_ϕ → z ~ q_ϕ → decoder(z, mem).  Also runs r_ψ for KL.
         phase="infer":
-            r_ψ → z ~ r_ψ → decoder(z, x_S).  q_ϕ not called.
+            r_ψ → z ~ r_ψ → decoder(z, mem).  q_ϕ not called.
+
+        Decoder memory source (controlled by use_masked_enc_memory):
+            False (default / Mod A): obs_emb from observed_projection on raw
+                features.  Optionally compressed through a bottleneck MLP
+                (Mod A) or randomly dropped during training (obs_emb_drop).
+            True  (Mod B): per-frame representations from r_ψ.  These carry
+                context-aware but naturally bottlenecked information, and are
+                identical between training and inference.
         """
         if self.pose_rep == "xyz":
             batch["x_xyz"] = batch["x"]
 
         x = batch["x"]
         coalition_mask = batch.get("coalition_mask")
-        B, J, F, T = x.shape
-
-        # Observed features: x with zeros at masked positions.
-        if coalition_mask is not None:
-            x_obs = self._make_observed_input(x, coalition_mask)
-        else:
-            x_obs = x
-        obs_emb, obs_mask = self._make_observed_memory(x_obs, batch["mask"], coalition_mask)
 
         if phase == "infer":
+            # r_ψ: supplies both z (at inference) and Mod-B frame tokens.
             masked_out = self.masked_encoder(batch)
             mu = masked_out["mu_masked"]
             logvar = masked_out["logvar_masked"]
             batch["mu_masked"] = mu
             batch["logvar_masked"] = logvar
+            obs_emb = self._get_decoder_memory(x, batch["mask"], coalition_mask, masked_out)
+
         else:
-            # q_ϕ: coalition-aware full encoder
+            # Mod B: r_ψ must run before decoding so its frame tokens are
+            # available; do it first and reuse for KL too.
+            masked_out = None
+            if self.use_masked_enc_memory and coalition_mask is not None:
+                masked_out = self.masked_encoder(batch)
+                batch["mu_masked"] = masked_out["mu_masked"]
+                batch["logvar_masked"] = masked_out["logvar_masked"]
+
+            # q_ϕ: coalition-aware full encoder (provides z during training).
             full_out = self.full_encoder(batch)
             batch["mu_full"] = full_out["mu_full"]
             batch["logvar_full"] = full_out["logvar_full"]
             mu = full_out["mu_full"]
             logvar = full_out["logvar_full"]
 
-            # r_ψ: masked encoder (for KL)
-            if coalition_mask is not None:
+            # r_ψ for KL (skip if already run for Mod B above).
+            if masked_out is None and coalition_mask is not None:
                 masked_out = self.masked_encoder(batch)
                 batch["mu_masked"] = masked_out["mu_masked"]
                 batch["logvar_masked"] = masked_out["logvar_masked"]
 
-        # Sample z and decode.
+            obs_emb = self._get_decoder_memory(x, batch["mask"], coalition_mask, masked_out)
+
+            # Mod A / obs_emb_drop: random frame-token dropout during training
+            # to weaken the decoder's per-frame shortcut, forcing z-reliance.
+            if obs_emb is not None and not self.use_masked_enc_memory \
+                    and self.obs_emb_drop > 0.0:
+                T_obs, B_obs = obs_emb.shape[0], obs_emb.shape[1]
+                keep = torch.rand(T_obs, B_obs, 1, device=obs_emb.device) >= self.obs_emb_drop
+                obs_emb = obs_emb * keep.float()
+
         z = self.reparameterize(mu, logvar)
         batch["z"] = z
         batch["mu"] = mu
         batch["logvar"] = logvar
 
-        # Provide observed-feature embeddings as "frame_tokens" so the
-        # existing Decoder_TRANSFORMER picks them up as additional memory.
-        # During training, randomly drop entire frame-token time-steps to
-        # weaken the decoder's per-frame shortcut through obs_emb, forcing
-        # it to rely on z for information about unobserved joints.
-        if self.training and self.obs_emb_drop > 0.0:
-            T_obs = obs_emb.shape[0]
-            B_obs = obs_emb.shape[1]
-            keep = torch.rand(T_obs, B_obs, 1, device=obs_emb.device) >= self.obs_emb_drop
-            obs_emb = obs_emb * keep.float()
-        batch["frame_tokens"] = obs_emb
+        if obs_emb is not None:
+            batch["frame_tokens"] = obs_emb
+        else:
+            batch.pop("frame_tokens", None)
 
         batch.update(self.decoder(batch))
 
@@ -367,6 +423,36 @@ class VaeacMotion(nn.Module):
             batch["output_xyz"] = batch["output"]
 
         return batch
+
+    def _get_decoder_memory(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        coalition_mask: torch.Tensor | None,
+        masked_out: dict | None,
+    ) -> torch.Tensor | None:
+        """Return the (T, B, D) tensor used as decoder frame_tokens.
+
+        use_obs_emb=False (standard / z-only): always returns None.
+            Decoder receives only z, matching original ACTOR and standard VAEAC.
+            x_S conditioning happens implicitly through r_ψ → z.
+        Mod B (use_masked_enc_memory=True): use r_ψ frame representations.
+        Mod A / default: project raw observed features through observed_projection.
+        Returns None when no conditioning is available.
+        """
+        if not self.use_obs_emb:
+            return None
+        if self.use_masked_enc_memory:
+            if masked_out is not None:
+                return masked_out.get("frame_tokens")
+            return None
+        # Default / Mod A path: raw obs features projected to latent dim.
+        if coalition_mask is not None:
+            x_obs = self._make_observed_input(x, coalition_mask)
+        else:
+            x_obs = x
+        obs_emb, _ = self._make_observed_memory(x_obs, mask, coalition_mask)
+        return obs_emb
 
     # ------------------------------------------------------------------
     # VAEAC ELBO
@@ -505,24 +591,23 @@ class VaeacMotion(nn.Module):
             "lengths": lengths, "coalition_mask": coalition_mask,
         }
 
-        # r_ψ encoding (once — reuse mu/logvar for all samples).
+        # r_ψ encoding (once — reuse mu/logvar and frame tokens for all samples).
         masked_out = self.masked_encoder(b)
         mu = masked_out["mu_masked"]
         logvar = masked_out["logvar_masked"]
         std = (0.5 * logvar).exp()
 
-        # Observed-feature memory (same for all samples).
-        x_obs = self._make_observed_input(x, coalition_mask)
-        obs_emb, _ = self._make_observed_memory(x_obs, mask, coalition_mask)
+        # Decoder memory: Mod B uses r_ψ frame tokens; default uses obs_proj.
+        obs_emb = self._get_decoder_memory(x, mask, coalition_mask, masked_out)
 
         obs_xmask = self._coalition_to_xmask(coalition_mask, x.shape)
 
         completions: list[torch.Tensor] = []
         for _ in range(n_samples):
             z = torch.randn_like(std) * std + mu
-            dec_batch = {
-                **b, "z": z, "frame_tokens": obs_emb,
-            }
+            dec_batch = {**b, "z": z}
+            if obs_emb is not None:
+                dec_batch["frame_tokens"] = obs_emb
             x_hat = self.decoder(dec_batch)["output"]
             if paste_observed:
                 x_hat[obs_xmask] = x[obs_xmask]
@@ -597,58 +682,65 @@ if __name__ == "__main__":
         dropout=0.0, ablation=None, activation="gelu",
     )
 
-    full_enc = VaeacFullEncoder(**common)
-    masked_enc = VaeacMaskedEncoder(**common)
-    dec = Decoder_TRANSFORMER(**common)
-
-    model = VaeacMotion(
-        full_enc, masked_enc, dec,
-        latent_dim=16, njoints=J, nfeats=F, device=dev,
-    )
-
     x = torch.randn(B, J, F, T)
     y = torch.zeros(B, dtype=torch.long)
     mask = torch.ones(B, T, dtype=torch.bool)
     lengths = torch.full((B,), T, dtype=torch.long)
-
-    # ---- Training forward (spatial mask) ----
     cm_sp = torch.ones(B, J, dtype=torch.bool)
     cm_sp[:, 3:6] = False
-    batch = {"x": x, "y": y, "mask": mask, "lengths": lengths,
-             "coalition_mask": cm_sp}
-    out = model(dict(batch), phase="train")
-    assert out["output"].shape == (B, J, F, T)
-    assert "mu_full" in out and "mu_masked" in out
-    loss, ld = model.compute_loss(out, lambda_kl=1.0)
-    assert loss.isfinite(), f"Loss not finite: {loss}"
-    assert ld["kl"] >= 0, f"KL must be non-negative: {ld['kl']}"
-
-    # ---- Training forward (temporal mask) ----
     cm_t = torch.ones(B, T, dtype=torch.bool)
     cm_t[:, :T // 4] = False
-    batch_t = {"x": x, "y": y, "mask": mask, "lengths": lengths,
-               "coalition_mask": cm_t}
-    out_t = model(dict(batch_t), phase="train")
-    loss_t, _ = model.compute_loss(out_t, lambda_kl=1.0)
-    assert loss_t.isfinite()
 
-    # ---- Inference (r_ψ only) ----
-    out_i = model(dict(batch), phase="infer")
-    assert "mu_masked" in out_i
-    assert "mu_full" not in out_i
+    def _build_model(**kwargs):
+        full_enc = VaeacFullEncoder(**common)
+        masked_enc = VaeacMaskedEncoder(**common)
+        dec = Decoder_TRANSFORMER(**common)
+        return VaeacMotion(full_enc, masked_enc, dec,
+                           latent_dim=16, njoints=J, nfeats=F, device=dev,
+                           **kwargs)
 
-    # ---- sample_completions ----
-    comps = model.sample_completions(
-        x[:1], y[:1], mask[:1], lengths[:1], cm_sp[:1], n_samples=3,
-    )
-    assert len(comps) == 3 and comps[0].shape == (1, J, F, T)
+    def _smoke(model, tag):
+        model.train()
+        batch = {"x": x, "y": y, "mask": mask, "lengths": lengths,
+                 "coalition_mask": cm_sp}
+        out = model(dict(batch), phase="train")
+        assert out["output"].shape == (B, J, F, T), f"{tag}: bad output shape"
+        assert "mu_full" in out and "mu_masked" in out, f"{tag}: missing encoder keys"
+        loss, ld = model.compute_loss(out, lambda_kl=1.0)
+        assert loss.isfinite(), f"{tag}: loss not finite"
+        assert ld["kl"] >= 0, f"{tag}: KL negative"
 
-    # Verify observed joints are pasted back.
-    obs_joints = cm_sp[0]  # (J,)
-    for c in comps:
-        for j in range(J):
-            if obs_joints[j]:
-                assert torch.allclose(c[0, j], x[0, j]), \
-                    f"Observed joint {j} not pasted back"
+        # temporal mask
+        batch_t = {"x": x, "y": y, "mask": mask, "lengths": lengths,
+                   "coalition_mask": cm_t}
+        out_t = model(dict(batch_t), phase="train")
+        assert model.compute_loss(out_t, lambda_kl=1.0)[0].isfinite(), \
+            f"{tag}: temporal loss not finite"
 
-    print("Smoke test OK")
+        # inference
+        model.eval()
+        out_i = model(dict(batch), phase="infer")
+        assert "mu_masked" in out_i and "mu_full" not in out_i, \
+            f"{tag}: infer keys wrong"
+
+        # sample_completions
+        comps = model.sample_completions(
+            x[:1], y[:1], mask[:1], lengths[:1], cm_sp[:1], n_samples=3,
+        )
+        assert len(comps) == 3 and comps[0].shape == (1, J, F, T), \
+            f"{tag}: completions shape wrong"
+        obs_joints = cm_sp[0]
+        for c in comps:
+            for j in range(J):
+                if obs_joints[j]:
+                    assert torch.allclose(c[0, j], x[0, j]), \
+                        f"{tag}: observed joint {j} not pasted back"
+        print(f"  {tag}: OK")
+
+    print("--- Smoke tests ---")
+    _smoke(_build_model(), "baseline (plain Linear)")
+    _smoke(_build_model(obs_emb_bottleneck=8),  "Mod A bottleneck=8")
+    _smoke(_build_model(obs_emb_bottleneck=32), "Mod A bottleneck=32")
+    _smoke(_build_model(use_masked_enc_memory=True), "Mod B (masked enc memory)")
+    _smoke(_build_model(obs_emb_bottleneck=16, obs_emb_drop=0.1), "Mod A + drop=0.1")
+    print("All smoke tests passed.")

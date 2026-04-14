@@ -1,47 +1,36 @@
 """
-train_vaeac_motion.py — Train VaeacMotion for manifold-constrained SHAP
-=======================================================================
+train_vaeac_actor_motion.py — Train VaeacActorMotion for manifold-constrained SHAP
+====================================================================================
 
-Implements proper VAEAC training (Ivanov ICLR 2019; Olsen JMLR 2022) on the
-ACTOR Transformer backbone.
+Trains a sequence-latent VAEAC where the encoder latent is a full T×D sequence
+rather than a single D-vector.  See model/actor/vaeac_actor_motion.py for the
+full architectural description.
 
 Architecture
 ------------
-q_ϕ(z|x,S)     VaeacFullEncoder   — sees full x + coalition marker.
-r_ψ(z|x_S,S)   VaeacMaskedEncoder — sees only observed joints (mask tokens).
-p_θ(x̂|z,x_S,S) Decoder_TRANSFORMER conditioned on z AND observed-feature
-                embeddings.  This is the key difference from previous attempts:
-                the decoder cross-attends to the raw observed input, not to
-                encoder representations.  Training and inference memory are
-                identical, eliminating the mismatch that caused mean-pose
-                collapse.
+q_φ(z | x)          VaeacActorFullEncoder — sees complete sequence, outputs
+                     per-frame (T, B, D) mu / logvar.
+r_ψ(z | x_S, S)     VaeacActorMaskedEncoder — replaces unobserved positions
+                     with learned mask tokens, outputs (T, B, D) mu / logvar.
+p_θ(x̂ | z)          Decoder_TRANSFORMER — cross-attends to z_seq as T memory
+                     tokens (plus one class-conditioning token).
 
-VAEAC ELBO
-----------
-L = E_{z~q_ϕ} [MSE_{held-out}(x, x̂)]
-    − λ_kl · KL(q_ϕ(z|x,S) ‖ r_ψ(z|x_S,S))
-    − λ_reg · prior_reg(r_ψ)
-    + λ_vel · velocity_loss(held-out)
-    + λ_rc_obs · MSE_{observed}(x, x̂)
+Objective
+---------
+L = MSE(p_θ(z_φ), x)          full-sequence reconstruction (like ACTOR)
+    + λ_vel · velocity_loss    full-sequence velocity
+    − λ_kl  · KL(q_φ ‖ r_ψ)  per-frame regularisation aligning r_ψ to q_φ
+    − λ_reg · prior_reg(r_ψ)  Ivanov prior stabiliser
 
-Gradient routing (per Ivanov 2019):
-    q_ϕ: reconstruction + velocity (via reparameterised z).
-          DETACHED from KL so KL only trains r_ψ.
+Gradient routing:
+    q_φ: reconstruction + velocity only (DETACHED from KL).
     r_ψ: KL + prior regularisation only.
     p_θ: reconstruction + velocity.
-    observed_projection: reconstruction + velocity (decoder memory).
-
-Weights initialised from a pre-trained ActorCVAE checkpoint:
-    q_ϕ._encoder → CVAE encoder,  target_marker = 0.
-    r_ψ._encoder → CVAE encoder,  mask tokens = 0.
-    p_θ          → CVAE decoder.
-    observed_projection → random (new parameter).
 
 Typical command::
 
-    python train_vaeac_motion.py \\
-        --cvae_ckpt experiment_outs/actor_cvae/<run>/actor_cvae_best.ckpt \\
-        --dataset BMCLab --fold 1 --epochs 300 --lr 1e-4 \\
+    python train_vaeac_actor_motion.py \\
+        --dataset H36M --fold 1 --epochs 300 --lr 1e-4 \\
         --lambda_kl 0.01 --kl_warmup_epochs 30 \\
         --wandb_project CARE-PD
 """
@@ -67,10 +56,13 @@ from model.actor.shap_masking import (
     build_temporal_shap_mask,
     build_temporal_windows,
     sample_spatial_training_mask,
-    sample_temporal_training_mask,
 )
-from model.actor.transformer_arch import Decoder_TRANSFORMER, Encoder_TRANSFORMER
-from model.actor.vaeac_motion import VaeacFullEncoder, VaeacMaskedEncoder, VaeacMotion
+from model.actor.transformer_arch import Decoder_TRANSFORMER
+from model.actor.vaeac_actor_motion import (
+    VaeacActorFullEncoder,
+    VaeacActorMaskedEncoder,
+    VaeacActorMotion,
+)
 from train_actor_cvae import masked_mean_joint_motion, masked_mpjpe
 from train_utils import make_trainer
 from utility.utils import set_random_seed
@@ -81,7 +73,41 @@ if _SCRIPTS not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# Periodic GIF callback
+# Temporal mask sampler — same as train_vaeac_motion.py
+# ---------------------------------------------------------------------------
+
+def sample_temporal_training_mask_mixed(
+    B: int,
+    T: int,
+    device: torch.device,
+    stride_sim_prob: float = 0.5,
+) -> torch.Tensor:
+    """Mix contiguous quarter-blocks and stride-simulated temporal coalition masks."""
+    masks = torch.ones(B, T, dtype=torch.bool, device=device)
+    for i in range(B):
+        if torch.rand(1).item() < stride_sim_prob:
+            stride_period = int(torch.randint(15, 46, (1,)).item())
+            windows = build_temporal_windows(T, stride_period, K=4)
+            observed = [k for k in range(4) if torch.rand(1).item() > 0.5]
+            if len(observed) == 0:
+                observed = [0]
+            masks[i] = build_temporal_shap_mask(observed, windows, T, device)
+        else:
+            quarter = T // 4
+            window_frames = [
+                list(range(k * quarter, (k + 1) * quarter if k < 3 else T))
+                for k in range(4)
+            ]
+            for frames in window_frames:
+                if torch.rand(1).item() < 0.5:
+                    masks[i, frames] = False
+            if masks[i].sum() == 0:
+                masks[i, window_frames[0]] = True
+    return masks
+
+
+# ---------------------------------------------------------------------------
+# GIF callback (identical to train_vaeac_motion.py)
 # ---------------------------------------------------------------------------
 
 class ImputationGifCallback(pl.Callback):
@@ -189,93 +215,25 @@ class ImputationGifCallback(pl.Callback):
 
 
 # ---------------------------------------------------------------------------
-# Temporal mask sampler — mixes contiguous quarters and stride-simulated windows
-# ---------------------------------------------------------------------------
-
-def sample_temporal_training_mask_mixed(
-    B: int,
-    T: int,
-    device: torch.device,
-    stride_sim_prob: float = 0.5,
-) -> torch.Tensor:
-    """Sample temporal coalition masks that cover both training and inference patterns.
-
-    At inference (evaluate_shap.py) temporal coalitions are stride-phase-aligned
-    non-contiguous windows (e.g. W0 = {0-8, 27-35, 54-62} across strides).
-    Training with only contiguous quarter-blocks means the observed_projection W
-    has never seen such alternating indicator patterns.
-
-    This function mixes two distributions per batch element:
-      - p = 1 - stride_sim_prob: contiguous quarter-blocks (original behaviour).
-      - p = stride_sim_prob:     stride-simulated non-contiguous windows, using
-                                 a random stride period uniform in [15, 45] frames
-                                 and randomly held-out gait-phase windows.
-
-    Args:
-        B:               Batch size.
-        T:               Number of frames.
-        device:          Target device.
-        stride_sim_prob: Fraction of batch elements that use stride-simulated masks.
-
-    Returns:
-        BoolTensor (B, T) — True = frame observed.
-    """
-    masks = torch.ones(B, T, dtype=torch.bool, device=device)
-    for i in range(B):
-        if torch.rand(1).item() < stride_sim_prob:
-            # Stride-simulated: pick a random plausible gait stride period.
-            stride_period = int(torch.randint(15, 46, (1,)).item())
-            windows = build_temporal_windows(T, stride_period, K=4)
-            # Randomly hold out each of the 4 gait-phase windows with p=0.5.
-            observed = [k for k in range(4) if torch.rand(1).item() > 0.5]
-            if len(observed) == 0:
-                observed = [0]  # guarantee at least one observed window
-            masks[i] = build_temporal_shap_mask(observed, windows, T, device)
-        else:
-            # Contiguous quarter-blocks (original sample_temporal_training_mask).
-            quarter = T // 4
-            window_frames = [
-                list(range(k * quarter, (k + 1) * quarter if k < 3 else T))
-                for k in range(4)
-            ]
-            for frames in window_frames:
-                if torch.rand(1).item() < 0.5:
-                    masks[i, frames] = False
-            if masks[i].sum() == 0:
-                masks[i, window_frames[0]] = True
-    return masks
-
-
-# ---------------------------------------------------------------------------
 # Lightning module
 # ---------------------------------------------------------------------------
 
-class VaeacMotionModule(pl.LightningModule):
-    """PyTorch Lightning wrapper for VaeacMotion training.
+class VaeacActorMotionModule(pl.LightningModule):
+    """PyTorch Lightning wrapper for VaeacActorMotion training.
 
-    Args:
-        model:              VaeacMotion instance.
-        lr:                 Learning rate for r_ψ, decoder, observed_projection.
-        lr_full_enc:        Learning rate for q_ϕ._encoder (usually lower
-                            to preserve pre-trained quality).
-        lambda_kl:          Final KL weight (after warmup).
-        kl_warmup_epochs:   Linear ramp 0 → lambda_kl over this many epochs.
-        kl_n_cycles:        Cyclical KL annealing (Fu et al. 2019).  Each cycle
-                            ramps 0→lambda_kl over half the cycle and holds for
-                            the other half.  0 = plain linear warmup (legacy).
-        total_epochs:       Total epochs (needed for cyclical schedule).
-        lambda_reg:         Weight for r_ψ prior regularization.
-        lambda_vel:         Weight for velocity loss on held-out joints.
-        lambda_rc_obs:      Weight for reconstruction on observed joints.
-        prior_sigma_mu:     Normal prior width on μ_ψ (Ivanov Eq.8).
-        prior_sigma_sigma:  Gamma prior tightness on σ_ψ (Ivanov Eq.8).
-        mask_axis:          "spatial", "temporal", or "both".
-        diversity_n_samples: Completions per val epoch for diversity probe.
+    Gradient routing:
+        q_φ backbone: slow LR (preserves representation quality).
+        r_ψ + decoder: full LR (must learn mask-token encoding fast).
+
+    Diversity probe (on_validation_epoch_end):
+        mu/logvar from encoders are (T, B, D).  We mean-pool over T before
+        computing pairwise latent distances, giving a D-dim per-sequence
+        summary comparable to VaeacMotion's (B, D) latent diversity.
     """
 
     def __init__(
         self,
-        model: VaeacMotion,
+        model: VaeacActorMotion,
         lr: float,
         lr_full_enc: float | None = None,
         *,
@@ -285,7 +243,6 @@ class VaeacMotionModule(pl.LightningModule):
         total_epochs: int = 300,
         lambda_reg: float = 1e-6,
         lambda_vel: float = 5.0,
-        lambda_rc_obs: float = 0.1,
         prior_sigma_mu: float = 1e4,
         prior_sigma_sigma: float = 1e-4,
         mask_axis: str = "spatial",
@@ -301,7 +258,6 @@ class VaeacMotionModule(pl.LightningModule):
         self.total_epochs = total_epochs
         self.lambda_reg = lambda_reg
         self.lambda_vel = lambda_vel
-        self.lambda_rc_obs = lambda_rc_obs
         self.prior_sigma_mu = prior_sigma_mu
         self.prior_sigma_sigma = prior_sigma_sigma
         self.mask_axis = mask_axis
@@ -310,32 +266,17 @@ class VaeacMotionModule(pl.LightningModule):
 
     def _build_actor_batch(self, x, lab, pad_mask):
         device = x.device
-        pad_mask = pad_mask.bool()
-        b = actor_batch_from_carepd(x, pad_mask, self.model.num_classes, device)
+        b = actor_batch_from_carepd(x, pad_mask.bool(), self.model.num_classes, device)
         b["y"] = lab.long().to(device)
         return b
 
     def _effective_lambda_kl(self) -> float:
-        """KL weight with optional cyclical annealing (Fu et al. 2019).
-
-        kl_n_cycles > 0:  Divide training into N equal cycles.  Within each
-            cycle, linearly ramp 0 → lambda_kl over the first half, then hold
-            lambda_kl for the second half.  This gives the decoder repeated
-            opportunities to learn z-dependence before KL is raised again.
-        kl_n_cycles == 0: Legacy linear warmup over kl_warmup_epochs.
-        """
         if self.kl_n_cycles > 0:
             cycle_len = max(1, self.total_epochs // self.kl_n_cycles)
             pos_in_cycle = self.current_epoch % cycle_len
             ramp_half = cycle_len // 2
-            if ramp_half <= 0:
-                frac = 1.0
-            elif pos_in_cycle < ramp_half:
-                frac = pos_in_cycle / ramp_half
-            else:
-                frac = 1.0
+            frac = pos_in_cycle / ramp_half if (ramp_half > 0 and pos_in_cycle < ramp_half) else 1.0
             return frac * self.lambda_kl
-
         if self.kl_warmup_epochs <= 0:
             return self.lambda_kl
         frac = min(1.0, self.current_epoch / max(1, self.kl_warmup_epochs))
@@ -366,7 +307,6 @@ class VaeacMotionModule(pl.LightningModule):
             lambda_kl=lam_kl,
             lambda_reg=self.lambda_reg,
             lambda_vel=self.lambda_vel,
-            lambda_rc_obs=self.lambda_rc_obs,
             prior_sigma_mu=self.prior_sigma_mu,
             prior_sigma_sigma=self.prior_sigma_sigma,
         )
@@ -429,6 +369,7 @@ class VaeacMotionModule(pl.LightningModule):
             cm_div[0, :4] = False
             masked_idx = (~cm_div[0]).nonzero(as_tuple=True)[0]
 
+            # ---- completion diversity ----
             with torch.no_grad():
                 completions = self.model.sample_completions(
                     b["x"], b["y"], b["mask"], b["lengths"],
@@ -445,12 +386,11 @@ class VaeacMotionModule(pl.LightningModule):
                 pairs = 0
                 for i in range(K):
                     for j in range(i + 1, K):
-                        diff = (stacked[i] - stacked[j]).pow(2).mean().sqrt()
-                        div += float(diff.item())
+                        div += float((stacked[i] - stacked[j]).pow(2).mean().sqrt().item())
                         pairs += 1
                 div /= max(pairs, 1)
 
-            # r_ψ inference-mode imputation: how dynamic is the output?
+            # ---- inference-mode imputation motion ----
             with torch.no_grad():
                 b_infer = {**b, "coalition_mask": cm_div}
                 out_inf = self.model(dict(b_infer), phase="infer")
@@ -458,7 +398,8 @@ class VaeacMotionModule(pl.LightningModule):
                     out_inf["output"], out_inf["mask"],
                 )
 
-            # μ diversity across random coalitions.
+            # ---- μ diversity across random coalitions ----
+            # mu_masked / mu_full are (T, B, D); mean-pool over T for pairwise L2.
             with torch.no_grad():
                 n_probe = 8
                 mu_masked_list, mu_full_list = [], []
@@ -468,19 +409,20 @@ class VaeacMotionModule(pl.LightningModule):
                         "x": b["x"], "y": b["y"], "mask": b["mask"],
                         "coalition_mask": cm_rand,
                     })
-                    mu_masked_list.append(out_m["mu_masked"].squeeze(0))
+                    # (T, 1, D) → mean over T → (1, D) → squeeze → (D,)
+                    mu_masked_list.append(out_m["mu_masked"].mean(0).squeeze(0))
+
                     out_f = self.model.full_encoder({
                         "x": b["x"], "y": b["y"], "mask": b["mask"],
-                        "coalition_mask": cm_rand,
                     })
-                    mu_full_list.append(out_f["mu_full"].squeeze(0))
+                    mu_full_list.append(out_f["mu_full"].mean(0).squeeze(0))
 
-                mu_masked_t = torch.stack(mu_masked_list, dim=0)
+                mu_masked_t = torch.stack(mu_masked_list, dim=0)  # (n_probe, D)
                 mu_full_t = torch.stack(mu_full_list, dim=0)
                 mu_div_psi = float(torch.cdist(mu_masked_t, mu_masked_t).mean())
                 mu_div_phi = float(torch.cdist(mu_full_t, mu_full_t).mean())
 
-            # σ diagnostics.
+            # ---- σ diagnostics ----
             with torch.no_grad():
                 fixed_cm = torch.ones(1, 17, dtype=torch.bool, device=device)
                 fixed_cm[0, :4] = False
@@ -511,36 +453,28 @@ class VaeacMotionModule(pl.LightningModule):
                 best_so_far = getattr(self, "_best_diversity_val", -1.0)
                 if div > best_so_far:
                     self._best_diversity_val = div
-                    save_path = os.path.join(_best_dir, "vaeac_motion_best_diversity.ckpt")
+                    save_path = os.path.join(_best_dir, "vaeac_actor_motion_best_diversity.ckpt")
                     torch.save({"state_dict": self.state_dict()}, save_path)
                     parts.append(f"[saved best-div ckpt @ {div:.6f}]")
 
         if parts:
             print(
-                f"[VaeacMotion epoch {self.current_epoch}] " + "  ".join(parts),
+                f"[VaeacActorMotion epoch {self.current_epoch}] " + "  ".join(parts),
                 flush=True,
             )
 
     def configure_optimizers(self):
-        # q_ϕ base encoder: slow LR to preserve pre-trained weights.
-        # q_ϕ target_marker: full LR — must learn coalition awareness.
-        # r_ψ: full LR — must learn mask-token handling.
-        # Decoder + observed_projection: full LR.
-        full_enc_backbone = list(self.model.full_encoder._encoder.parameters())
-        full_enc_marker = [self.model.full_encoder.target_marker]
-        full_enc_backbone_ids = {id(p) for p in full_enc_backbone}
-        full_enc_marker_ids = {id(p) for p in full_enc_marker}
-
+        # q_φ backbone: slow LR — already encodes high-quality motion.
+        # r_ψ + decoder: full LR — must learn to work with mask tokens.
+        full_enc_params = list(self.model.full_encoder._encoder.parameters())
+        full_enc_ids = {id(p) for p in full_enc_params}
         other_params = [
             p for p in self.model.parameters()
-            if id(p) not in full_enc_backbone_ids
-            and id(p) not in full_enc_marker_ids
+            if id(p) not in full_enc_ids
         ]
-
         param_groups = [
-            {"params": full_enc_backbone, "lr": self.lr_full_enc},
-            {"params": full_enc_marker, "lr": self.lr},
-            {"params": other_params, "lr": self.lr},
+            {"params": full_enc_params, "lr": self.lr_full_enc},
+            {"params": other_params,    "lr": self.lr},
         ]
         return torch.optim.AdamW(param_groups, weight_decay=1e-4)
 
@@ -551,16 +485,17 @@ class VaeacMotionModule(pl.LightningModule):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="VaeacMotion training for manifold-constrained temporal SHAP.",
+        description="VaeacActorMotion training — per-frame latent VAEAC on ACTOR backbone.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--config", type=str, default=None)
     p.add_argument("--devices", type=str, default="4,5,6,7")
-    p.add_argument("--dataset", type=str, default="BMCLab",
+    p.add_argument("--dataset", type=str, default="H36M",
                    choices=["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait", "H36M"])
     p.add_argument("--carepd_pose_npz", type=str, default=None)
     p.add_argument("--carepd_labels_pkl", type=str, default=None)
-    p.add_argument("--num_folds", type=int, default=23)
+    p.add_argument("--num_folds", type=int, default=7,
+                   help="Number of LOSO folds (7 for H36M, 23 for BMCLab).")
     p.add_argument("--fold", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--source_seq_len", type=int, default=81)
@@ -569,7 +504,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr_full_enc", type=float, default=None,
-                   help="q_ϕ backbone LR (default: lr/10).")
+                   help="q_φ backbone LR (default: lr/10).")
 
     # Architecture.
     p.add_argument("--latent_dim", type=int, default=256)
@@ -579,57 +514,26 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--num_classes", type=int, default=3)
 
-    # Checkpoint.
-    p.add_argument("--cvae_ckpt", type=str, default=None,
-                   help="Path to a trained ActorCVAE checkpoint.")
+    # Checkpoint resume (VaeacActorMotion only — no CVAE warm-start).
     p.add_argument("--resume_ckpt", type=str, default=None,
-                   help="Path to a VaeacMotion Lightning checkpoint to resume from. "
-                        "Loads model weights only (not optimizer/epoch state). "
-                        "Compatible with legacy checkpoints (auto-detects "
-                        "use_obs_indicator). Mutually exclusive with --cvae_ckpt.")
+                   help="Path to a VaeacActorMotion Lightning checkpoint to resume from. "
+                        "Loads model weights only (not optimizer/epoch state).")
 
     # VAEAC loss hyperparameters.
     p.add_argument("--mask_axis", type=str, default="spatial",
                    choices=("spatial", "temporal", "both"))
-    p.add_argument("--lambda_kl", type=float, default=0.01)
+    p.add_argument("--lambda_kl", type=float, default=0.01,
+                   help="KL weight. /T normalisation in compute_loss keeps this "
+                        "at the same scale as VaeacMotion's λ_kl.")
     p.add_argument("--kl_warmup_epochs", type=int, default=30)
     p.add_argument("--kl_n_cycles", type=int, default=0,
-                   help="Cyclical KL annealing (Fu et al. 2019). Number of "
-                        "ramp-up/hold cycles over the full training run. "
-                        "0 = legacy linear warmup over --kl_warmup_epochs.")
+                   help="Cyclical KL annealing (Fu et al. 2019). 0 = linear warmup.")
     p.add_argument("--lambda_reg", type=float, default=1e-6)
     p.add_argument("--lambda_vel", type=float, default=5.0)
-    p.add_argument("--lambda_rc_obs", type=float, default=0.1)
-    p.add_argument("--obs_emb_drop", type=float, default=0.0,
-                   help="Probability of dropping entire obs_emb frame-tokens "
-                        "during training. Forces decoder to rely on z for "
-                        "information about unobserved joints.")
-    p.add_argument("--obs_emb_bottleneck", type=int, default=0,
-                   help="[Mod A] Bottleneck dim for the observed_projection MLP "
-                        "(0 = plain Linear; 16/32/64 = 2-layer MLP with that "
-                        "bottleneck). Forces lossy compression of per-frame obs "
-                        "signal so decoder must use z for lost information. "
-                        "Incompatible with --resume_ckpt (projection reinitialised).")
-    p.add_argument("--use_masked_enc_memory", action="store_true",
-                   help="[Mod B] Use masked encoder (r_psi) per-frame "
-                        "representations as decoder memory instead of the raw "
-                        "observed_projection path. Aligns with original VAEAC "
-                        "design: same memory at train and inference, natural "
-                        "information bottleneck through the encoder transformer.")
-    p.add_argument("--no_obs_emb", action="store_true",
-                   help="Standard VAEAC / z-only decoder. Do not pass any "
-                        "observed-feature embeddings to the decoder. The decoder "
-                        "receives only z, as in the original ACTOR and standard "
-                        "VAEAC formulation. x_S conditioning is implicit through "
-                        "r_psi encoding x_S into z. Removes the per-frame shortcut "
-                        "that causes diversity collapse. Recommended for H36M "
-                        "pretraining where r_psi has enough data to learn a rich "
-                        "conditional prior.")
     p.add_argument("--prior_sigma_mu", type=float, default=1e4,
                    help="Ivanov Eq.8: normal prior width on μ_ψ.")
     p.add_argument("--prior_sigma_sigma", type=float, default=1e-4,
-                   help="Ivanov Eq.8: gamma prior tightness on σ_ψ. "
-                        "Larger = more freedom for σ_ψ to deviate from 1.0.")
+                   help="Ivanov Eq.8: gamma prior tightness on σ_ψ.")
     p.add_argument("--diversity_n_samples", type=int, default=10)
 
     # Callbacks.
@@ -639,8 +543,8 @@ def parse_args():
 
     # Output.
     p.add_argument("--checkpoint_dir", type=str,
-                   default="./experiment_outs/vaeac_motion")
-    p.add_argument("--experiment_name", type=str, default="VaeacMotion")
+                   default="./experiment_outs/vaeac_actor_motion")
+    p.add_argument("--experiment_name", type=str, default="VaeacActorMotion")
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_run_name", type=str, default=None)
@@ -669,7 +573,7 @@ def main():
         args.lr_full_enc = args.lr / 10.0
 
     tag_ds = f"{args.dataset}_fold{args.fold}"
-    run_tag = f"vaeac_motion_{tag_ds}_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+    run_tag = f"vaeac_actor_motion_{tag_ds}_{datetime.datetime.now():%Y%m%d_%H%M%S}"
     ckpt_dir = os.path.join(args.checkpoint_dir, run_tag)
     os.makedirs(ckpt_dir, exist_ok=True)
     with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
@@ -688,91 +592,32 @@ def main():
         dropout=args.dropout, ablation=None, activation="gelu",
     )
 
-    full_enc = VaeacFullEncoder(**common)
-    masked_enc = VaeacMaskedEncoder(**common)
+    full_enc = VaeacActorFullEncoder(**common)
+    masked_enc = VaeacActorMaskedEncoder(**common)
     decoder = Decoder_TRANSFORMER(**common)
 
-    model = VaeacMotion(
+    model = VaeacActorMotion(
         full_enc, masked_enc, decoder,
         latent_dim=args.latent_dim,
         njoints=17, nfeats=3,
         device=device,
         pose_rep="xyz",
         num_classes=args.num_classes,
-        obs_emb_drop=args.obs_emb_drop,
-        obs_emb_bottleneck=args.obs_emb_bottleneck,
-        use_masked_enc_memory=args.use_masked_enc_memory,
-        use_obs_emb=not args.no_obs_emb,
     ).to(device)
 
-    if args.resume_ckpt and args.cvae_ckpt:
-        raise SystemExit("--resume_ckpt and --cvae_ckpt are mutually exclusive.")
     if args.resume_ckpt:
         raw = torch.load(args.resume_ckpt, map_location=device)
         sd = raw.get("state_dict", raw)
         sd = {(k[len("model."):] if k.startswith("model.") else k): v
               for k, v in sd.items()}
-
-        # Auto-detect legacy / z-only checkpoints.
-        ckpt_proj_key = "observed_projection.weight"  # present in plain-Linear ckpts
-        ckpt_has_plain_linear = ckpt_proj_key in sd
-        if ckpt_has_plain_linear:
-            proj_shape = sd[ckpt_proj_key].shape
-            proj_in = proj_shape[1]
-            # (1, 1) dummy weight → z-only checkpoint; model must match.
-            if proj_shape == (1, 1):
-                if model.use_obs_emb:
-                    raise RuntimeError(
-                        "[resume] Checkpoint is z-only (use_obs_emb=False) but "
-                        "model was built without --no_obs_emb. Add --no_obs_emb."
-                    )
-            elif not model.use_obs_emb:
-                raise RuntimeError(
-                    "[resume] Checkpoint has obs_emb projection but model was "
-                    "built with --no_obs_emb. Remove --no_obs_emb."
-                )
-            elif proj_in == 17 * 3 and model.use_obs_indicator:
-                print("[resume] Legacy checkpoint (obs_proj input=51) detected — "
-                      "setting use_obs_indicator=False and rebuilding projection.")
-                model.use_obs_indicator = False
-                if args.obs_emb_bottleneck > 0:
-                    model.observed_projection = torch.nn.Sequential(
-                        torch.nn.Linear(17 * 3, args.obs_emb_bottleneck),
-                        torch.nn.GELU(),
-                        torch.nn.Linear(args.obs_emb_bottleneck, args.latent_dim),
-                    ).to(device)
-                else:
-                    model.observed_projection = torch.nn.Linear(
-                        17 * 3, args.latent_dim).to(device)
-
-        # Mod A: checkpoint has a plain Linear but model has a bottleneck MLP.
-        # Drop the projection keys and reinitialise from scratch.
-        drop_proj = args.obs_emb_bottleneck > 0 and ckpt_has_plain_linear
-        if drop_proj:
-            n_dropped = sum(1 for k in sd if k.startswith("observed_projection."))
-            sd = {k: v for k, v in sd.items() if not k.startswith("observed_projection.")}
-            print(f"[resume] Mod A: dropping {n_dropped} observed_projection.* keys "
-                  f"from checkpoint (bottleneck={args.obs_emb_bottleneck}, will reinit).")
-
-        missing, unexpected = model.load_state_dict(sd, strict=False)
-        # Any mismatch outside the projection layer is a real error.
-        real_missing = [k for k in missing if not k.startswith("observed_projection.")]
-        real_unexpected = [k for k in unexpected if not k.startswith("observed_projection.")]
-        if real_missing or real_unexpected:
-            raise RuntimeError(
-                f"Checkpoint load error — missing: {real_missing}, "
-                f"unexpected: {real_unexpected}"
-            )
+        missing, unexpected = model.load_state_dict(sd, strict=True)
         if missing or unexpected:
-            print(f"[resume] Skipped projection keys — missing: {missing}, "
-                  f"unexpected: {unexpected}")
-        print(f"Resumed VaeacMotion weights from: {args.resume_ckpt}")
-    elif args.cvae_ckpt:
-        model.load_from_cvae_checkpoint(args.cvae_ckpt)
-        print(f"Loaded ActorCVAE checkpoint: {args.cvae_ckpt}")
+            raise RuntimeError(
+                f"Checkpoint load error — missing: {missing}, unexpected: {unexpected}"
+            )
+        print(f"Resumed VaeacActorMotion weights from: {args.resume_ckpt}")
     else:
-        print("WARNING: no --cvae_ckpt or --resume_ckpt provided. "
-              "Starting from random weights.")
+        print("Starting VaeacActorMotion from random weights (no --resume_ckpt provided).")
 
     # ---- Datasets -----------------------------------------------------------
     train_ds, val_ds = get_carepd_datasets(args)
@@ -797,7 +642,7 @@ def main():
         )
 
     # ---- Lightning module + trainer -----------------------------------------
-    module = VaeacMotionModule(
+    module = VaeacActorMotionModule(
         model,
         lr=args.lr,
         lr_full_enc=args.lr_full_enc,
@@ -807,7 +652,6 @@ def main():
         total_epochs=args.epochs,
         lambda_reg=args.lambda_reg,
         lambda_vel=args.lambda_vel,
-        lambda_rc_obs=args.lambda_rc_obs,
         prior_sigma_mu=args.prior_sigma_mu,
         prior_sigma_sigma=args.prior_sigma_sigma,
         mask_axis=args.mask_axis,
@@ -821,7 +665,7 @@ def main():
             ModelCheckpoint(
                 dirpath=ckpt_dir,
                 every_n_epochs=args.checkpoint_every_n_epochs,
-                filename="vaeac_motion_epoch{epoch:04d}",
+                filename="vaeac_actor_motion_epoch{epoch:04d}",
                 save_top_k=-1,
             ),
         )
@@ -841,13 +685,13 @@ def main():
         ckpt_dir=ckpt_dir,
         logger=logger,
         monitor_key="val/mixed",
-        phase_tag="vaeac_motion",
+        phase_tag="vaeac_actor_motion",
         extra_callbacks=extra_callbacks if extra_callbacks else None,
         find_unused_parameters=True,
         save_last_only=True,
     )
     trainer.fit(module, train_loader, val_loader)
-    print(f"Done. Last: {ckpt_dir}/vaeac_motion_last.ckpt")
+    print(f"Done. Last: {ckpt_dir}/vaeac_actor_motion_last.ckpt")
 
 
 if __name__ == "__main__":
