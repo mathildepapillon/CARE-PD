@@ -420,6 +420,9 @@ def evaluate_temporal_shap_all_methods(
     if device is None:
         device = x.device
 
+    # Move shared tensors to device once so boolean-index ops are device-consistent.
+    train_mean = train_mean.to(device)
+
     K = 4
     T = x.shape[-1]
     x_np = x[0].cpu().numpy()  # (J, F, T)
