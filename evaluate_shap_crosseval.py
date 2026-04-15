@@ -471,6 +471,7 @@ def main() -> None:
             classifier_fn = build_classifier_fn(
                 motion_encoder, mask, args.backbone,
                 zscore_mean=zscore_mean, zscore_std=zscore_std,
+                x_orig=x,
             )
             zero_impute_fn = make_zero_impute_fn(classifier_fn)
 

@@ -100,6 +100,19 @@ def matrix_to_rotation_6d(matrix: torch.Tensor) -> torch.Tensor:
     """
     return matrix[..., :2, :].clone().reshape(*matrix.size()[:-2], 6)
 
+
+def axis_angle_to_rotation_6d(axis_angle: torch.Tensor) -> torch.Tensor:
+    """Zhou 6D from axis-angle (same chain as SMPL ``get_6D_rep_from_24x3_pose``, no padding).
+
+    Args:
+        axis_angle: (..., 3) rotation vectors (SMPL axis-angle or H36M exp-map per joint).
+
+    Returns:
+        (..., 6) continuous rotation features (first two rows of the rotation matrix).
+    """
+    return matrix_to_rotation_6d(axis_angle_to_matrix(axis_angle))
+
+
 def get_6D_rep_from_24x3_pose(pose):
     pose6d = matrix_to_rotation_6d(axis_angle_to_matrix(pose)).detach().cpu().numpy()
     pose6d=np.pad(pose6d, ((0,0), (0,1), (0,0))) # Adding [0,0,0,0,0,0] for translation

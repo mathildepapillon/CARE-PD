@@ -21,6 +21,7 @@ from data.bmclab_datareader import BMCLabReader
 from data.tsdupd_datareader import TSDUPD_Reader
 from data.pdgam_datareader import PDGaMReader
 from data.threedgait_datareader import GAIT3DReader
+from data.h36m_datareader import H36MReader
 from data.augmentations import MirrorReflection, RandomRotation, RandomNoise, axis_mask
 from learning.utils import compute_class_weights
 from const.path import PROJECT_ROOT
@@ -28,6 +29,7 @@ from const.path import PROJECT_ROOT
 _TOTAL_SCORES = 3
 _MAJOR_JOINTS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 _SMPL_6D_ELEMENTS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+_H36M_ROT6D_ELEMENTS = list(range(32))
 _MAJOR_JOINTS_MIRRORED = [0, 4, 5, 6, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 11, 12, 13]
 _HUMAN_ML3D_POSE_ELEMENTS = list(range(263))
 
@@ -736,6 +738,8 @@ class ProcessedDataset(data.Dataset):
             joints = _HUMAN_ML3D_POSE_ELEMENTS
         elif  self._params['data_type'] == '6DSMPL':
             joints = _SMPL_6D_ELEMENTS
+        elif self._params['data_type'] == '6D_ROTATIONS':
+            joints = _H36M_ROT6D_ELEMENTS
         return joints
 
     def __len__(self):
@@ -755,7 +759,7 @@ class ProcessedDataset(data.Dataset):
         video_idx = self.video_name_to_index[self.video_names[idx]] 
 
         joints = self._get_joint_orders()
-        if self._params['data_type'] in ['h36m', '6DSMPL']:
+        if self._params['data_type'] in ['h36m', '6DSMPL', '6D_ROTATIONS']:
             assert x.shape[1] == len(joints)
             x = x[:, joints, :]
         elif self._params['data_type'] in ['humanML3D']:
@@ -845,7 +849,7 @@ def dataset_factory(params, backbone, fold):
         'momask': os.path.join(root_dir, params['experiment_name'],
                                f"{params['dataset']}_augment_False", f"{params['num_folds']}fold"),
         'motionclip': os.path.join(root_dir, params['experiment_name'],
-                               f"{params['dataset']}", f"{params['num_folds']}fold"),
+                               f"{params['dataset']}_{params['data_type']}", f"{params['num_folds']}fold"),
     }
 
     datareader_mapper = {
@@ -868,6 +872,10 @@ def dataset_factory(params, backbone, fold):
             'h36m': GAIT3DReader,
             'humanML3D': GAIT3DReader,
             '6DSMPL': GAIT3DReader
+        },
+        'H36M': {
+            'h36m': H36MReader,
+            '6D_ROTATIONS': H36MReader,
         }
     }
 

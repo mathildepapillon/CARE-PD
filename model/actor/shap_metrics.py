@@ -287,6 +287,23 @@ def make_marginal_impute_fn(
     return _fn
 
 
+def make_physics_impute_fn(
+    physics_completer: Any,
+    classifier: Callable,
+    mask: torch.Tensor,
+    lengths: torch.Tensor,
+    n_samples: int = 5,
+) -> Callable:
+    """Return an impute_fn that uses PhysicsInformedCompleter manifold-constrained completions."""
+    from model.actor.shap_compute import value_fn_physics
+    def _fn(x, y, _mask, _lengths, coalition_mask):
+        return value_fn_physics(
+            physics_completer, classifier, x, y, mask, lengths,
+            coalition_mask, n_samples=n_samples,
+        )
+    return _fn
+
+
 # ---------------------------------------------------------------------------
 # SHAP faithfulness — random perturbation control (ShapGCN)
 # ---------------------------------------------------------------------------
@@ -640,6 +657,7 @@ def compute_spatial_faithfulness_batched(
     joint_means: torch.Tensor | None = None,
     train_pool: torch.Tensor | None = None,
     actor_shap: Any | None = None,
+    physics_completer: Any | None = None,
     n_samples: int = 20,
     k_list: tuple[int, ...] = (1, 2, 3, 5),
     n_random_repeats: int = 10,
@@ -658,11 +676,13 @@ def compute_spatial_faithfulness_batched(
     B=1 forward passes to a handful of B=chunk_size passes.
 
     Args:
-        method:     ``"zero"`` | ``"mean"`` | ``"marginal"`` | ``"actor"``.
-        n_samples:  Donor draws (marginal) or completions (actor) per coalition.
-        seq_idx:    Seed for random PGI/PGU joint selection and random
-                    deletion/insertion order — matches ``seed=`` in the
-                    individual metric functions for reproducibility.
+        method:            ``"zero"`` | ``"mean"`` | ``"marginal"`` | ``"actor"`` | ``"physics"``.
+        physics_completer: PhysicsInformedCompleter — required for method="physics".
+                           ``set_subject()`` should have been called beforehand.
+        n_samples:         Donor draws (marginal) or completions (actor/physics) per coalition.
+        seq_idx:           Seed for random PGI/PGU joint selection and random
+                           deletion/insertion order — matches ``seed=`` in the
+                           individual metric functions for reproducibility.
 
     Returns:
         Same dict structure as the ``_faithfulness_block`` pattern in
@@ -801,6 +821,19 @@ def compute_spatial_faithfulness_batched(
         all_probs = np.array([
             all_comp_probs[s:e].mean() for s, e in zip(starts, slice_ends)
         ])
+
+    elif method == "physics":
+        if physics_completer is None:
+            raise ValueError("physics_completer is required for method='physics'")
+        from model.actor.shap_compute import value_fn_physics
+        all_probs_list: list[float] = []
+        for i in range(N):
+            v = value_fn_physics(
+                physics_completer, classifier_fn, x, y, mask, lengths,
+                cms_t[i : i + 1], n_samples=n_samples,
+            )
+            all_probs_list.append(v)
+        all_probs = np.array(all_probs_list)
 
     else:
         raise ValueError(f"Unknown method: {method!r}")

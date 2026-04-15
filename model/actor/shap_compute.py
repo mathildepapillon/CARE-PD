@@ -416,6 +416,75 @@ def value_fn_marginal(
     return float(np.mean(probs))
 
 
+@torch.no_grad()
+def value_fn_physics(
+    physics_completer: Any,
+    classifier: Callable,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    lengths: torch.Tensor,
+    coalition_mask: torch.Tensor,
+    n_samples: int = 5,
+) -> float:
+    """Value function with physics-informed manifold-constrained completion.
+
+    Masked joints are filled by drawing samples from the conditional distribution
+    p(x_masked | x_observed) estimated by PhysicsInformedCompleter.  This is the
+    only on-manifold baseline: completions respect per-subject bone lengths,
+    joint covariance, and temporal smoothness.
+
+    Args:
+        physics_completer: PhysicsInformedCompleter instance (set_subject must have
+                           been called before entering the coalition loop).
+        classifier:        callable(x_hat: Tensor(1,J,F,T)) → logits Tensor(1,n_classes).
+        x:                 (1, J, F, T) input sequence in global-pelvis space.
+        y:                 (1,) UPDRS label.
+        mask:              (1, T) real-frame mask.
+        lengths:           (1,) frame count.
+        coalition_mask:    (1, J) — True = observed.
+        n_samples:         completions to average over.
+
+    Returns:
+        float — mean predicted probability for the ground-truth class.
+    """
+    completions = physics_completer.sample_completions(
+        x, y, mask, lengths, coalition_mask,
+        n_samples=n_samples, paste_observed=True,
+    )
+    class_idx = int(y[0].item())
+    probs = _batch_classify(classifier, completions, class_idx)
+    return float(probs.mean())
+
+
+@torch.no_grad()
+def value_fn_physics_temporal(
+    physics_completer: Any,
+    classifier: Callable,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    lengths: torch.Tensor,
+    window_assignments: list[list[int]],
+    coalition_z: tuple[int, ...],
+    n_samples: int,
+) -> float:
+    """Expected class probability under physics completions for a temporal coalition."""
+    K = len(window_assignments)
+    T = x.shape[-1]
+    device = x.device
+    observed_windows = [k for k in range(K) if coalition_z[k] == 1]
+    cm = build_temporal_shap_mask(
+        observed_windows, window_assignments, T, device,
+    ).unsqueeze(0)
+    completions = physics_completer.sample_completions(
+        x, y, mask, lengths, cm, n_samples=n_samples,
+    )
+    class_idx = int(y[0].item())
+    probs = _batch_classify(classifier, completions, class_idx)
+    return float(probs.mean())
+
+
 # ---------------------------------------------------------------------------
 # Spatial SHAP — 17 individual joints
 # ---------------------------------------------------------------------------
@@ -618,6 +687,7 @@ def compute_spatial_shap_baseline(
     lengths: torch.Tensor,
     joint_means: torch.Tensor | None = None,
     train_pool: torch.Tensor | None = None,
+    physics_completer: Any = None,
     n_kernel_samples: int = 3000,
     n_marginal_samples: int = 20,
     seed: int | None = None,
@@ -628,28 +698,31 @@ def compute_spatial_shap_baseline(
     Only the replacement strategy for masked joints changes.
 
     Args:
-        method:          "zero" | "mean" | "marginal".
-        classifier:      callable(x_hat: Tensor(1,J,F,T)) → logits Tensor(1,n_classes).
-        x:               (1, J, F, T).
-        y:               (1,) label.
-        mask:            (1, T) real-frame mask (not used for replacement; kept for
-                         interface parity with compute_spatial_shap).
-        lengths:         (1,) frame count.
-        joint_means:     (J, F) training mean — required for method="mean".
-        train_pool:      (N, J, F, T) training sequences — required for method="marginal".
+        method:           "zero" | "mean" | "marginal" | "physics".
+        classifier:       callable(x_hat: Tensor(1,J,F,T)) → logits Tensor(1,n_classes).
+        x:                (1, J, F, T).
+        y:                (1,) label.
+        mask:             (1, T) real-frame mask.
+        lengths:          (1,) frame count.
+        joint_means:      (J, F) training mean — required for method="mean".
+        train_pool:       (N, J, F, T) training sequences — required for method="marginal".
+        physics_completer: PhysicsInformedCompleter — required for method="physics".
+                           set_subject() should have been called before this function.
         n_kernel_samples: number of coalition pairs sampled.
-        n_marginal_samples: draws per coalition for method="marginal".
-        seed:            random seed.
+        n_marginal_samples: draws per coalition for method="marginal" or "physics".
+        seed:             random seed.
 
     Returns:
         dict — same structure as compute_spatial_shap: individual joint keys + group keys.
     """
-    if method not in {"zero", "mean", "marginal"}:
-        raise ValueError(f"method must be 'zero', 'mean', or 'marginal'; got {method!r}")
+    if method not in {"zero", "mean", "marginal", "physics"}:
+        raise ValueError(f"method must be 'zero', 'mean', 'marginal', or 'physics'; got {method!r}")
     if method == "mean" and joint_means is None:
         raise ValueError("joint_means is required for method='mean'")
     if method == "marginal" and train_pool is None:
         raise ValueError("train_pool is required for method='marginal'")
+    if method == "physics" and physics_completer is None:
+        raise ValueError("physics_completer is required for method='physics'")
 
     M = 17
     J, F, T = x.shape[1], x.shape[2], x.shape[3]
@@ -691,7 +764,7 @@ def compute_spatial_shap_baseline(
         )  # (N_total, J, F, T)
         all_values = _classify_chunked(classifier, x_batch, class_idx)
 
-    else:  # marginal
+    elif method == "marginal":
         # Pre-sample all donor indices upfront: (N_total, n_marginal_samples).
         # Process coalitions in outer chunks so the per-chunk donor tensor fits
         # in GPU memory comfortably.
@@ -725,6 +798,20 @@ def compute_spatial_shap_baseline(
 
         all_values = np.concatenate(all_values_list)  # (N_total,)
 
+    elif method == "physics":
+        # Serial evaluation: each coalition requires a unique conditional distribution.
+        # Cholesky factors are cached inside physics_completer keyed by held-feature set,
+        # so repeated coalitions with the same mask are fast.
+        all_values_list2: list[float] = []
+        for ci in range(N_total):
+            cm_1j = all_cms_t[ci:ci + 1]   # (1, J) bool, True = observed
+            v = value_fn_physics(
+                physics_completer, classifier, x, y, mask, lengths,
+                cm_1j, n_samples=n_marginal_samples,
+            )
+            all_values_list2.append(v)
+        all_values = np.array(all_values_list2)
+
     v_empty = float(all_values[0])
     v_full  = float(all_values[1])
     values  = np.array(all_values[2:], dtype=np.float64)
@@ -748,6 +835,7 @@ def compute_temporal_shap_baseline(
     window_assignments: list[list[int]] | None = None,
     joint_means: torch.Tensor | None = None,
     train_pool: torch.Tensor | None = None,
+    physics_completer: Any | None = None,
     n_marginal_samples: int = 20,
     fps: int = 30,
     seed: int | None = None,
@@ -761,19 +849,25 @@ def compute_temporal_shap_baseline(
     fills *all joints* in masked frames, not individual joints.
 
     Args:
-        method:          "zero" | "mean" | "marginal".
+        method:          "zero" | "mean" | "marginal" | "physics".
         classifier, x, y, mask, lengths, window_assignments, fps: same as
                          compute_temporal_shap.
         joint_means:     (J, F) training mean (method="mean").
         train_pool:      (N, J, F, T) training sequences (method="marginal").
-        n_marginal_samples: draws per coalition for method="marginal".
+        physics_completer: PhysicsInformedCompleter (method="physics"); required
+                         when using physics temporal masking.
+        n_marginal_samples: draws per coalition for "marginal" or "physics".
         seed:            random seed for method="marginal".
 
     Returns:
         {window_name: Shapley value} for K=4 windows.
     """
-    if method not in {"zero", "mean", "marginal"}:
-        raise ValueError(f"method must be 'zero', 'mean', or 'marginal'; got {method!r}")
+    if method not in {"zero", "mean", "marginal", "physics"}:
+        raise ValueError(
+            f"method must be 'zero', 'mean', 'marginal', or 'physics'; got {method!r}",
+        )
+    if method == "physics" and physics_completer is None:
+        raise ValueError("physics_completer is required for method='physics'")
 
     K = 4
     T = x.shape[-1]
@@ -813,7 +907,7 @@ def compute_temporal_shap_baseline(
         all_probs = _batch_classify(classifier, x_batch_list, class_idx)
         values = all_probs
 
-    else:  # marginal
+    elif method == "marginal":
         N_pool = train_pool.shape[0]
         all_coal_values: list[float] = []
 
@@ -838,6 +932,17 @@ def compute_temporal_shap_baseline(
             all_coal_values.append(float(probs.mean()))
 
         values = np.array(all_coal_values)
+
+    else:
+        # physics — sequential coalition eval (conditional Gaussian per mask)
+        all_coal_values2: list[float] = []
+        for z in coalitions:
+            v = value_fn_physics_temporal(
+                physics_completer, classifier, x, y, mask, lengths,
+                window_assignments, z, n_marginal_samples,
+            )
+            all_coal_values2.append(v)
+        values = np.array(all_coal_values2)
 
     # itertools.product([0,1], K) produces all-zeros first and all-ones last.
     v_empty = float(values[0])

@@ -557,7 +557,7 @@ def parse_args():
     p.add_argument("--config", type=str, default=None)
     p.add_argument("--devices", type=str, default="4,5,6,7")
     p.add_argument("--dataset", type=str, default="BMCLab",
-                   choices=["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait"])
+                   choices=["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait", "H36M"])
     p.add_argument("--carepd_pose_npz", type=str, default=None)
     p.add_argument("--carepd_labels_pkl", type=str, default=None)
     p.add_argument("--num_folds", type=int, default=23)
@@ -604,6 +604,27 @@ def parse_args():
                    help="Probability of dropping entire obs_emb frame-tokens "
                         "during training. Forces decoder to rely on z for "
                         "information about unobserved joints.")
+    p.add_argument("--obs_emb_bottleneck", type=int, default=0,
+                   help="[Mod A] Bottleneck dim for the observed_projection MLP "
+                        "(0 = plain Linear; 16/32/64 = 2-layer MLP with that "
+                        "bottleneck). Forces lossy compression of per-frame obs "
+                        "signal so decoder must use z for lost information. "
+                        "Incompatible with --resume_ckpt (projection reinitialised).")
+    p.add_argument("--use_masked_enc_memory", action="store_true",
+                   help="[Mod B] Use masked encoder (r_psi) per-frame "
+                        "representations as decoder memory instead of the raw "
+                        "observed_projection path. Aligns with original VAEAC "
+                        "design: same memory at train and inference, natural "
+                        "information bottleneck through the encoder transformer.")
+    p.add_argument("--no_obs_emb", action="store_true",
+                   help="Standard VAEAC / z-only decoder. Do not pass any "
+                        "observed-feature embeddings to the decoder. The decoder "
+                        "receives only z, as in the original ACTOR and standard "
+                        "VAEAC formulation. x_S conditioning is implicit through "
+                        "r_psi encoding x_S into z. Removes the per-frame shortcut "
+                        "that causes diversity collapse. Recommended for H36M "
+                        "pretraining where r_psi has enough data to learn a rich "
+                        "conditional prior.")
     p.add_argument("--prior_sigma_mu", type=float, default=1e4,
                    help="Ivanov Eq.8: normal prior width on μ_ψ.")
     p.add_argument("--prior_sigma_sigma", type=float, default=1e-4,
@@ -679,6 +700,9 @@ def main():
         pose_rep="xyz",
         num_classes=args.num_classes,
         obs_emb_drop=args.obs_emb_drop,
+        obs_emb_bottleneck=args.obs_emb_bottleneck,
+        use_masked_enc_memory=args.use_masked_enc_memory,
+        use_obs_emb=not args.no_obs_emb,
     ).to(device)
 
     if args.resume_ckpt and args.cvae_ckpt:
@@ -688,14 +712,60 @@ def main():
         sd = raw.get("state_dict", raw)
         sd = {(k[len("model."):] if k.startswith("model.") else k): v
               for k, v in sd.items()}
-        # Auto-detect legacy checkpoints without the obs indicator.
-        proj_in = sd["observed_projection.weight"].shape[1]
-        if proj_in == 17 * 3 and model.use_obs_indicator:
-            print("[resume] Legacy checkpoint (obs_proj input=51) detected — "
-                  "setting use_obs_indicator=False and rebuilding projection.")
-            model.use_obs_indicator = False
-            model.observed_projection = torch.nn.Linear(17 * 3, args.latent_dim).to(device)
-        model.load_state_dict(sd, strict=True)
+
+        # Auto-detect legacy / z-only checkpoints.
+        ckpt_proj_key = "observed_projection.weight"  # present in plain-Linear ckpts
+        ckpt_has_plain_linear = ckpt_proj_key in sd
+        if ckpt_has_plain_linear:
+            proj_shape = sd[ckpt_proj_key].shape
+            proj_in = proj_shape[1]
+            # (1, 1) dummy weight → z-only checkpoint; model must match.
+            if proj_shape == (1, 1):
+                if model.use_obs_emb:
+                    raise RuntimeError(
+                        "[resume] Checkpoint is z-only (use_obs_emb=False) but "
+                        "model was built without --no_obs_emb. Add --no_obs_emb."
+                    )
+            elif not model.use_obs_emb:
+                raise RuntimeError(
+                    "[resume] Checkpoint has obs_emb projection but model was "
+                    "built with --no_obs_emb. Remove --no_obs_emb."
+                )
+            elif proj_in == 17 * 3 and model.use_obs_indicator:
+                print("[resume] Legacy checkpoint (obs_proj input=51) detected — "
+                      "setting use_obs_indicator=False and rebuilding projection.")
+                model.use_obs_indicator = False
+                if args.obs_emb_bottleneck > 0:
+                    model.observed_projection = torch.nn.Sequential(
+                        torch.nn.Linear(17 * 3, args.obs_emb_bottleneck),
+                        torch.nn.GELU(),
+                        torch.nn.Linear(args.obs_emb_bottleneck, args.latent_dim),
+                    ).to(device)
+                else:
+                    model.observed_projection = torch.nn.Linear(
+                        17 * 3, args.latent_dim).to(device)
+
+        # Mod A: checkpoint has a plain Linear but model has a bottleneck MLP.
+        # Drop the projection keys and reinitialise from scratch.
+        drop_proj = args.obs_emb_bottleneck > 0 and ckpt_has_plain_linear
+        if drop_proj:
+            n_dropped = sum(1 for k in sd if k.startswith("observed_projection."))
+            sd = {k: v for k, v in sd.items() if not k.startswith("observed_projection.")}
+            print(f"[resume] Mod A: dropping {n_dropped} observed_projection.* keys "
+                  f"from checkpoint (bottleneck={args.obs_emb_bottleneck}, will reinit).")
+
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        # Any mismatch outside the projection layer is a real error.
+        real_missing = [k for k in missing if not k.startswith("observed_projection.")]
+        real_unexpected = [k for k in unexpected if not k.startswith("observed_projection.")]
+        if real_missing or real_unexpected:
+            raise RuntimeError(
+                f"Checkpoint load error — missing: {real_missing}, "
+                f"unexpected: {real_unexpected}"
+            )
+        if missing or unexpected:
+            print(f"[resume] Skipped projection keys — missing: {missing}, "
+                  f"unexpected: {unexpected}")
         print(f"Resumed VaeacMotion weights from: {args.resume_ckpt}")
     elif args.cvae_ckpt:
         model.load_from_cvae_checkpoint(args.cvae_ckpt)

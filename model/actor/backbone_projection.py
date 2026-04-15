@@ -36,9 +36,10 @@ Camera parameters
 All 2D projections use the CARE-PD ``backright`` view, whose parameters are
 hard-coded in ``data/preprocessing/smpl2h36m.py``:
 
-  image resolution    1100 × 1100 px
+  image resolution    1000 × 1000 px  (cfg.H = cfg.W = 1000 in smpl2h36m.py)
   focal length        fx = fy = 700
-  principal point     cx = cy = 550
+  principal point     cx = cy = 500   (cfg.H/2)
+  screen normalise    w = 1100         (image_resolution in generate_config_*.py)
   world→cam rotation  R = [[-1,0,0],[0,-1,0],[0,0,1]]
   world→cam trans     t = [[0, 1, 2]]   (camera 1 m above, 2 m behind)
   backright pre-rot   40° around the Y-axis (applied before world→cam)
@@ -82,9 +83,12 @@ _MIRRORED_JOINTS = [0, 4, 5, 6, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 11, 12, 13]
 # Camera constants for the CARE-PD backright view (smpl2h36m.py)
 # ---------------------------------------------------------------------------
 
-_IMG_WH = 1100       # image width = height in pixels
+_IMG_WH = 1100       # image width = height in pixels (used for screen normalisation)
 _FX = _FY = 700.0   # focal length (pixels)
-_CX = _CY = _IMG_WH / 2.0  # principal point = 550.0
+# Principal point comes from data/preprocessing/smpl2h36m.py: cfg.H = cfg.W = 1000,
+# so cx = cy = cfg.H/2 = 500.  The screen-normalisation divisor (_IMG_WH = 1100) is
+# set separately by the PoseFormerV2/MixSTE preprocessors' image_resolution config.
+_CX = _CY = 500.0   # principal point (pixels)
 
 # World→camera rotation for the backright view.
 _R_BACKRIGHT = torch.tensor(
