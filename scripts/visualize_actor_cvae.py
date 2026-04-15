@@ -46,8 +46,10 @@ from data.dataloaders import collate_fn  # noqa: E402
 from model.actor.cvae_data import (  # noqa: E402
     actor_batch_from_carepd,
     actor_batch_from_6dsmpl,
+    actor_batch_from_h36m_rot6d,
     get_carepd_datasets,
     get_6dsmpl_datasets,
+    get_h36m_rot6d_datasets,
 )
 from model.actor.motion_utils import unroot_to_global  # noqa: E402
 from model.actor.cvae import ActorCVAE  # noqa: E402
@@ -171,8 +173,8 @@ def save_actor_recon_gifs(
         fps:              GIF frame rate.
         output_filenames: Optional list of explicit filenames (length ≥ n_examples).
         verbose:          Print a line per saved file.
-        data_mode:        One of ``'carepd'``, ``'6dsmpl'``.
-        labels:           Optional ``(B,)`` label tensor (used for ``y`` in 6dsmpl mode).
+        data_mode:        One of ``'carepd'``, ``'6dsmpl'``, ``'h36m_rot6d'``.
+        labels:           Optional ``(B,)`` label tensor (used for rot6d modes).
 
     Returns:
         List of absolute paths to the saved GIF files.
@@ -183,6 +185,10 @@ def save_actor_recon_gifs(
     # Build ACTOR batch dict from the raw dataloader tensor
     if data_mode == "6dsmpl":
         b_dict = actor_batch_from_6dsmpl(x_batch.to(device), pad_mask.to(device), device)
+        if labels is not None:
+            b_dict["y"] = labels.long().to(device)
+    elif data_mode == "h36m_rot6d":
+        b_dict = actor_batch_from_h36m_rot6d(x_batch.to(device), pad_mask.to(device), device)
         if labels is not None:
             b_dict["y"] = labels.long().to(device)
     else:

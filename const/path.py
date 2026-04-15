@@ -290,6 +290,10 @@ POSE_AND_LABEL = {
             },
             'PATH_LABELS': f'{PROJECT_ROOT}/assets/datasets/H36M.pkl'
         },
+        '6D_ROTATIONS': {
+            'PATH_POSES': f'{PROJECT_ROOT}/assets/datasets/6D_ROTATIONS/H36M/h36m_rot6d_32j_30f_or_longer.npz',
+            'PATH_LABELS': f'{PROJECT_ROOT}/assets/datasets/H36M.pkl'
+        },
     },
 }
 

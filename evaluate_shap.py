@@ -513,6 +513,7 @@ def evaluate_sequence(
     classifier_fn = build_classifier_fn(
         motion_encoder, mask, backbone_name,
         zscore_mean=zscore_mean, zscore_std=zscore_std,
+        x_orig=x,
     )
 
     # ------------------------------------------------------------------
@@ -627,7 +628,7 @@ def evaluate_sequence(
     ):
         t_window_names = [k for k in t_shap if not k.startswith("_")]
         del_ins = _temporal_deletion_insertion_auc_batched(
-            classifier_fn, x, y, window_assignments, t_shap, m_name,
+            classifier_fn, x, y, mask, lengths, window_assignments, t_shap, m_name,
             joint_means=jm, train_pool=tp, seed=seq_idx,
             n_marginal_samples=n_completions,
         )

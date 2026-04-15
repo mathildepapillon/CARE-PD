@@ -14,8 +14,9 @@ Each output file  cache_dir/seq_{i:04d}.json  contains:
         "faithfulness": {...},   # same dict as compute_spatial_faithfulness_batched
     }
 
-The script is resume-safe: already-written files are skipped, so you can
-interrupt and restart freely.
+The script is resume-safe: at startup it scans ``cache_dir`` for existing
+``seq_*.json`` files, prints how many will be skipped, and never reloads test
+data for those indices (only missing sequences are loaded and computed).
 
 Usage::
 
@@ -32,6 +33,9 @@ Usage::
 
     # Quick smoke test (2 sequences):
     python scripts/precompute_physics_shap.py ... --max_sequences 2
+
+    # Cap CPU usage (default 2 threads; avoids grabbing all cores for BLAS/torch):
+    python scripts/precompute_physics_shap.py ... --num_threads 4
 """
 
 from __future__ import annotations
@@ -39,12 +43,48 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
-from typing import Optional
+
+
+def _configure_cpu_threads_before_imports() -> int:
+    """Limit BLAS/OpenMP threads (must run before numpy/torch import).
+
+    Reads ``--num_threads`` / ``--num_threads=N`` from argv, else env
+    ``PRECOMPUTE_PHYSICS_NUM_THREADS``, else 2.
+    """
+    default = int(os.environ.get("PRECOMPUTE_PHYSICS_NUM_THREADS", "2"))
+    n = default
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--num_threads" and i + 1 < len(argv):
+            n = int(argv[i + 1])
+            break
+        if a.startswith("--num_threads="):
+            n = int(a.split("=", 1)[1])
+            break
+        i += 1
+    n = max(1, n)
+    for var in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[var] = str(n)
+    return n
+
+
+_PRECOMPUTE_NUM_THREADS = _configure_cpu_threads_before_imports()
 
 import torch
-from torch.utils.data import DataLoader
+
+torch.set_num_threads(_PRECOMPUTE_NUM_THREADS)
+torch.set_num_interop_threads(1)
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -63,6 +103,20 @@ from model.actor.shap_eval_shared import (
     load_motion_encoder,
     build_classifier_fn,
 )
+
+_CACHE_SEQ_JSON_RE = re.compile(r"^seq_(\d{4})\.json$")
+
+
+def _scan_cached_seq_indices(cache_dir: str) -> set[int]:
+    """Return sequence indices that already have ``seq_{idx:04d}.json`` in *cache_dir*."""
+    if not os.path.isdir(cache_dir):
+        return set()
+    found: set[int] = set()
+    for name in os.listdir(cache_dir):
+        m = _CACHE_SEQ_JSON_RE.match(name)
+        if m:
+            found.add(int(m.group(1)))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +148,14 @@ def _parse_args() -> argparse.Namespace:
                     help="Physics sampling is CPU-bound; 'cpu' is fine. "
                          "Classifier forward passes benefit from 'cuda:0'.")
     ap.add_argument("--root_centered", action="store_true", default=False)
+    ap.add_argument(
+        "--num_threads",
+        type=int,
+        default=_PRECOMPUTE_NUM_THREADS,
+        help="Max CPU threads for PyTorch and BLAS/OpenMP. Default 2, or "
+             "PRECOMPUTE_PHYSICS_NUM_THREADS. Pass on the command line so it "
+             "applies before heavy imports (same flag as read at startup).",
+    )
     return ap.parse_args()
 
 
@@ -103,6 +165,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    torch.set_num_threads(args.num_threads)
     device = torch.device(args.device)
     k_list = tuple(args.k_list)
 
@@ -132,28 +195,41 @@ def main() -> None:
     print("[3/4] Loading test data …", flush=True)
     data_args = _raw_data_args(backbone_params, args.fold, batch_size=1)
     _, test_ds = get_carepd_datasets(data_args)
-    test_loader = DataLoader(
-        test_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate_fn,
-    )
     n_total = len(test_ds)
     print(f"  {n_total} test sequences", flush=True)
+
+    cached_seqs = _scan_cached_seq_indices(args.cache_dir)
+    if cached_seqs:
+        ordered = sorted(cached_seqs)
+        preview = ordered[:12]
+        tail = ""
+        if len(ordered) > 12:
+            tail = f", … (+{len(ordered) - 12} more)"
+        print(
+            f"  Pre-scan: {len(cached_seqs)} sequences already in cache "
+            f"(indices {preview}{tail}) — will skip those without loading data.",
+            flush=True,
+        )
+    else:
+        print("  Pre-scan: no seq_*.json in cache yet.", flush=True)
 
     # ------------------------------------------------------------------
     print("[4/4] Computing physics SHAP per sequence …", flush=True)
 
     n_done = n_skipped = 0
-    for seq_idx, raw_batch in enumerate(test_loader):
+    for seq_idx in range(n_total):
         if seq_idx < args.start_seq:
             continue
         if args.max_sequences is not None and seq_idx >= args.start_seq + args.max_sequences:
             break
 
         out_path = os.path.join(args.cache_dir, f"seq_{seq_idx:04d}.json")
-        if os.path.exists(out_path):
+        if os.path.isfile(out_path):
             print(f"  seq {seq_idx}/{n_total-1}  already cached — skipping", flush=True)
             n_skipped += 1
             continue
 
+        raw_batch = collate_fn([test_ds[seq_idx]])
         x_raw, labels, _, _, pad_mask = raw_batch
         batch = actor_batch_from_carepd(
             x_raw.float(), pad_mask, backbone_params["num_classes"], device,
@@ -173,6 +249,7 @@ def main() -> None:
         classifier_fn = build_classifier_fn(
             motion_encoder, mask, backbone_name,
             zscore_mean=zscore_mean, zscore_std=zscore_std,
+            x_orig=x,
         )
 
         t0 = time.perf_counter()

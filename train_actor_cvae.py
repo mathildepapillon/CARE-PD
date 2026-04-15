@@ -56,8 +56,10 @@ from model.actor.cvae import ActorCVAE
 from model.actor.cvae_data import (
     actor_batch_from_carepd,
     actor_batch_from_6dsmpl,
+    actor_batch_from_h36m_rot6d,
     get_carepd_datasets,
     get_6dsmpl_datasets,
+    get_h36m_rot6d_datasets,
 )
 from model.actor.transformer_arch import Decoder_TRANSFORMER, Encoder_TRANSFORMER
 from train_utils import make_trainer
@@ -117,6 +119,10 @@ class ActorCVAEModule(pl.LightningModule):
         lr_scheduler: str = "none",
         lr_step_size: int = 10,
         lr_gamma: float = 0.9,
+        ae_warmup_epochs: int = 0,
+        kl_anneal_epochs: int = 0,
+        free_nats: float = 0.1,
+        rc_l1: bool = False,
     ):
         super().__init__()
         self.model = model
@@ -125,6 +131,12 @@ class ActorCVAEModule(pl.LightningModule):
         self.lr_scheduler_name = lr_scheduler
         self.lr_step_size = lr_step_size
         self.lr_gamma = lr_gamma
+        self.ae_warmup_epochs = ae_warmup_epochs
+        self.kl_anneal_epochs = kl_anneal_epochs
+        self.free_nats = free_nats
+        self.rc_l1 = rc_l1
+        self._target_kl = model.lambdas.get("kl", 0.0)
+        self._target_kl_fb = model.lambdas.get("kl_fb", 0.0)
 
     def _build_actor_batch(
         self,
@@ -137,18 +149,54 @@ class ActorCVAEModule(pl.LightningModule):
         pad_mask = pad_mask.bool()
         if self.data_mode == "6dsmpl":
             b = actor_batch_from_6dsmpl(x, pad_mask, device)
+        elif self.data_mode == "h36m_rot6d":
+            b = actor_batch_from_h36m_rot6d(x, pad_mask, device)
         else:
             b = actor_batch_from_carepd(x, pad_mask, self.model.num_classes, device)
-        # Always use real clinical class labels (0/1/2 = UPDRS score).
         b["y"] = lab.long().to(device)
         return b
+
+    @property
+    def _in_ae_warmup(self) -> bool:
+        return self.ae_warmup_epochs > 0 and self.current_epoch < self.ae_warmup_epochs
+
+    def _anneal_fraction(self) -> float:
+        """0.0 at start of anneal period, 1.0 when fully annealed."""
+        if self._in_ae_warmup or self.kl_anneal_epochs <= 0:
+            return 0.0 if self._in_ae_warmup else 1.0
+        vae_epoch = self.current_epoch - self.ae_warmup_epochs
+        return min(1.0, vae_epoch / self.kl_anneal_epochs)
+
+    def _effective_kl_weight(self, target: float) -> float:
+        """KL weight schedule: 0 during AE warmup, linear ramp after, then full."""
+        if self._in_ae_warmup:
+            return 0.0
+        return target * self._anneal_fraction()
 
     def _step(self, batch, train: bool):
         x, lab, _vidx, _meta, pad_mask = batch
         b = self._build_actor_batch(x, lab, pad_mask)
 
+        b["_free_nats"] = self.free_nats
+        b["_rc_l1"] = self.rc_l1
+
+        if self._in_ae_warmup:
+            b["_ae_deterministic"] = True
+        else:
+            frac = self._anneal_fraction()
+            if frac < 1.0:
+                b["_noise_scale"] = frac
         out = self.model(b)
+
+        if "kl" in self.model.lambdas:
+            self.model.lambdas["kl"] = self._effective_kl_weight(self._target_kl)
+        if "kl_fb" in self.model.lambdas:
+            self.model.lambdas["kl_fb"] = self._effective_kl_weight(self._target_kl_fb)
         loss, ld = self.model.compute_loss(out)
+        if "kl" in self.model.lambdas:
+            self.model.lambdas["kl"] = self._target_kl
+        if "kl_fb" in self.model.lambdas:
+            self.model.lambdas["kl_fb"] = self._target_kl_fb
         mask = out["mask"]
 
         with torch.no_grad():
@@ -203,8 +251,20 @@ class ActorCVAEModule(pl.LightningModule):
             v = cm[k]
             parts.append(f"{k}={float(v):.6f}")
         if parts:
+            phase = "AE-warmup" if self._in_ae_warmup else "VAE"
+            tags = []
+            kl_w = self._effective_kl_weight(self._target_kl)
+            if kl_w < self._target_kl:
+                tags.append(f"λkl={kl_w:.2e}")
+            kl_fb_w = self._effective_kl_weight(self._target_kl_fb)
+            if kl_fb_w < self._target_kl_fb:
+                tags.append(f"λkl_fb={kl_fb_w:.2e}")
+            frac = self._anneal_fraction()
+            if not self._in_ae_warmup and frac < 1.0:
+                tags.append(f"noise={frac:.2f}")
+            tag_str = " " + " ".join(tags) if tags else ""
             print(
-                f"[ActorCVAE epoch {self.current_epoch}] " + "  ".join(parts),
+                f"[ActorCVAE epoch {self.current_epoch} ({phase}{tag_str})] " + "  ".join(parts),
                 flush=True,
             )
 
@@ -291,8 +351,13 @@ class ActorCvaeReconGifCallback(pl.Callback):
                 labels=lab_v,
             )
         )
+        def _hyperlink(path: str) -> str:
+            uri = f"file://{path}"
+            return f"\033]8;;{uri}\033\\{path}\033]8;;\033\\"
+
+        linked = [_hyperlink(p) for p in paths]
         print(
-            f"[ActorCVAE recon GIFs] epoch {ep} -> {paths}",
+            f"[ActorCVAE recon GIFs] epoch {ep} -> " + "  ".join(linked),
             flush=True,
         )
 
@@ -308,15 +373,17 @@ def parse_args():
                    help="CUDA_VISIBLE_DEVICES string (e.g. '0,1').")
     p.add_argument(
         "--data_mode", type=str, default="carepd",
-        choices=("carepd", "6dsmpl"),
+        choices=("carepd", "6dsmpl", "h36m_rot6d"),
         help=(
-            "carepd:  CARE-PD H36M-style clinical folds (17×3 XYZ). "
-            "6dsmpl:  CARE-PD 6D_SMPL rotations — ACTOR-parity mode "
-            "(24 joints × 6D, rc+rcxyz+kl loss with SMPL FK)."
+            "carepd:      CARE-PD H36M-style clinical folds (17×3 XYZ). "
+            "6dsmpl:      CARE-PD 6D_SMPL rotations — ACTOR-parity mode "
+            "(24 joints × 6D, rc+rcxyz+kl loss with SMPL FK). "
+            "h36m_rot6d:  H36M 6D rotation matrices from exp-map data "
+            "(32 joints × 6D, rc+rcxyz+kl with H36M FK)."
         ),
     )
     p.add_argument("--dataset", type=str, default="BMCLab",
-                   choices=["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait"],
+                   choices=["BMCLab", "T-SDU-PD", "PD-GaM", "3DGait", "H36M"],
                    help="CARE-PD dataset name (carepd / 6dsmpl modes).")
     p.add_argument(
         "--carepd_pose_npz", type=str, default=None,
@@ -336,8 +403,17 @@ def parse_args():
                         "MixSTE / MotionAGFormer, 80 for POTR, 90 for MotionBERT).")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--lr", type=float, default=1e-4,
-                   help="AdamW learning rate (ACTOR uses 1e-4).")
+    p.add_argument("--ae_warmup_epochs", type=int, default=0,
+                   help="Deterministic AE warmup (z=mu, no KL). Helps escape mean-pose collapse.")
+    p.add_argument("--kl_anneal_epochs", type=int, default=10,
+                   help="After AE warmup, linearly ramp lambda_kl from 0 to target over this many epochs.")
+    p.add_argument("--gradient_clip_val", type=float, default=1.0,
+                   help="Gradient norm clipping threshold. Lower (e.g. 0.1) prevents Adam from "
+                        "amplifying occasional large gradients into catastrophic collapses.")
+    p.add_argument("--resume_from_checkpoint", type=str, default=None,
+                   help="Path to a .ckpt file to resume/fine-tune from.")
+    p.add_argument("--lr", type=float, default=3e-4,
+                   help="AdamW learning rate.")
     p.add_argument(
         "--lr_scheduler", type=str, default="none", choices=("none", "step"),
         help="LR schedule: 'none' = plain AdamW (ACTOR default); 'step' = StepLR.",
@@ -398,7 +474,7 @@ def parse_args():
         "--lambda_vel", type=float, default=None,
         help=(
             "Frame-delta MSE on raw representation.  Default: 1.0 for 6dsmpl; "
-            "5.0 for carepd."
+            "2.0 for carepd."
         ),
     )
     p.add_argument(
@@ -407,6 +483,37 @@ def parse_args():
             "Frame-delta MSE on FK XYZ positions.  Prevents mean-pose collapse "
             "on gait-only data.  Default: 10.0 for 6dsmpl, 0.0 otherwise."
         ),
+    )
+    p.add_argument(
+        "--lambda_tstd", type=float, default=None,
+        help=(
+            "Two-sided temporal std MSE loss weight.  Default: 0.0 for all modes "
+            "(superseded by --lambda_tstd_hinge for carepd)."
+        ),
+    )
+    p.add_argument(
+        "--lambda_tstd_hinge", type=float, default=None,
+        help=(
+            "One-sided temporal std hinge loss weight.  Only penalises the model "
+            "when recon temporal std < GT temporal std — the strongest anti-mean-pose "
+            "signal.  Default: 500.0 for carepd, 0.0 otherwise."
+        ),
+    )
+    p.add_argument(
+        "--lambda_kl_fb", type=float, default=None,
+        help=(
+            "Free-bits KL weight (mean reduction + per-dim floor).  When >0, "
+            "replaces the sum-reduction KL ('kl') with a collapse-resistant "
+            "mean-reduction variant.  Default: 0.5 for carepd, 0.0 otherwise."
+        ),
+    )
+    p.add_argument(
+        "--free_nats", type=float, default=0.1,
+        help="Per-dimension free-bits floor (nats) for kl_fb loss.",
+    )
+    p.add_argument(
+        "--rc_l1", action="store_true", default=False,
+        help="Use L1 instead of MSE for the rc reconstruction loss.",
     )
 
     # --- Output / logging ---
@@ -421,11 +528,16 @@ def parse_args():
     )
     p.add_argument("--recon_gif_fps", type=int, default=12)
     p.add_argument(
-        "--no_frame_tokens", action="store_true", default=False,
+        "--no_frame_tokens", action="store_true", default=True,
         help="Train in z-only mode: frame_tokens produced by the encoder are NOT "
              "forwarded to the decoder.  Forces z to encode full temporal dynamics "
              "rather than delegating per-frame reconstruction to frame_tokens. "
-             "Required for ActorSHAP to produce diverse completions from z.",
+             "Required for ActorSHAP to produce diverse completions from z.  "
+             "Enabled by default; pass --use_frame_tokens to disable.",
+    )
+    p.add_argument(
+        "--use_frame_tokens", action="store_true", default=False,
+        help="Override --no_frame_tokens: forward encoder frame_tokens to decoder.",
     )
     p.add_argument(
         "--smpl_path", type=str, default=None,
@@ -458,7 +570,6 @@ def _resolve_mode_defaults(args):
             args.nfeats = 6
         if args.pose_rep is None:
             args.pose_rep = "rot6d"
-        # Losses: rc + rcxyz + vel + velxyz + kl
         if args.lambda_rcxyz is None:
             args.lambda_rcxyz = 1.0
         if args.lambda_rr is None:
@@ -467,8 +578,37 @@ def _resolve_mode_defaults(args):
             args.lambda_vel = 1.0
         if not hasattr(args, "lambda_velxyz") or args.lambda_velxyz is None:
             args.lambda_velxyz = 10.0
+        if args.lambda_tstd is None:
+            args.lambda_tstd = 0.0
+        if args.lambda_tstd_hinge is None:
+            args.lambda_tstd_hinge = 0.0
+        if args.lambda_kl_fb is None:
+            args.lambda_kl_fb = 0.0
+    elif args.data_mode == "h36m_rot6d":
+        # H36M 6D rotations: 32 joints × 6D
+        if args.njoints is None:
+            args.njoints = 32
+        if args.nfeats is None:
+            args.nfeats = 6
+        if args.pose_rep is None:
+            args.pose_rep = "rot6d"
+        # Match ACTOR loss recipe: rc + rcxyz + kl (+ vel + velxyz)
+        if args.lambda_rcxyz is None:
+            args.lambda_rcxyz = 1.0
+        if args.lambda_rr is None:
+            args.lambda_rr = 0.0
+        if args.lambda_vel is None:
+            args.lambda_vel = 1.0
+        if not hasattr(args, "lambda_velxyz") or args.lambda_velxyz is None:
+            args.lambda_velxyz = 10.0
+        if args.lambda_tstd is None:
+            args.lambda_tstd = 0.0
+        if args.lambda_tstd_hinge is None:
+            args.lambda_tstd_hinge = 0.0
+        if args.lambda_kl_fb is None:
+            args.lambda_kl_fb = 0.0
     else:
-        # carepd mode: 17 joints × 3 XYZ
+        # carepd mode: 17 joints × 3 XYZ — LSTM-VAE-aligned defaults
         if args.njoints is None:
             args.njoints = 17
         if args.nfeats is None:
@@ -480,9 +620,22 @@ def _resolve_mode_defaults(args):
         if args.lambda_rr is None:
             args.lambda_rr = 0.0
         if args.lambda_vel is None:
-            args.lambda_vel = 5.0
+            args.lambda_vel = 2.0
         if not hasattr(args, "lambda_velxyz") or args.lambda_velxyz is None:
             args.lambda_velxyz = 0.0
+        if args.lambda_tstd is None:
+            args.lambda_tstd = 0.0
+        if args.lambda_tstd_hinge is None:
+            args.lambda_tstd_hinge = 500.0
+        if args.lambda_kl_fb is None:
+            args.lambda_kl_fb = 0.5
+        if not args.rc_l1:
+            args.rc_l1 = True
+
+    # When free-bits KL is active, disable the sum-reduction KL to avoid
+    # double-counting.  Users can still force both with explicit CLI flags.
+    if args.lambda_kl_fb > 0 and args.lambda_kl == 1e-5:
+        args.lambda_kl = 0.0
 
 
 def main():
@@ -500,6 +653,30 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # ---- Load datasets (first, so we can auto-detect num_classes) --------
+    if args.data_mode == "6dsmpl":
+        train_ds, val_ds = get_6dsmpl_datasets(args)
+    elif args.data_mode == "h36m_rot6d":
+        train_ds, val_ds = get_h36m_rot6d_datasets(args)
+    else:
+        train_ds, val_ds = get_carepd_datasets(args)
+
+    import numpy as np
+    all_labels = np.concatenate([
+        np.asarray(train_ds.labels),
+        np.asarray(val_ds.labels),
+    ])
+    max_label = int(all_labels.max())
+    if max_label >= args.num_classes:
+        detected = max_label + 1
+        print(
+            f"[auto num_classes] Labels go up to {max_label} but "
+            f"--num_classes={args.num_classes}.  Overriding to {detected}."
+        )
+        args.num_classes = detected
+    unique_labels = sorted(set(all_labels.tolist()))
+    print(f"[label info] unique labels: {unique_labels}, num_classes={args.num_classes}")
+
     # ---- Build loss-weight dict (drop zero-weight terms) -----------------
     lambdas = {}
     if args.lambda_rc     > 0: lambdas["rc"]     = args.lambda_rc
@@ -509,6 +686,12 @@ def main():
     if args.lambda_vel    > 0: lambdas["vel"]    = args.lambda_vel
     if getattr(args, "lambda_velxyz", 0.0) > 0:
         lambdas["velxyz"] = args.lambda_velxyz
+    if getattr(args, "lambda_tstd", 0.0) > 0:
+        lambdas["tstd"] = args.lambda_tstd
+    if getattr(args, "lambda_tstd_hinge", 0.0) > 0:
+        lambdas["tstd_hinge"] = args.lambda_tstd_hinge
+    if getattr(args, "lambda_kl_fb", 0.0) > 0:
+        lambdas["kl_fb"] = args.lambda_kl_fb
 
     # ---- Build Transformer encoder + decoder (shared kwargs) -------------
     common = dict(
@@ -532,7 +715,7 @@ def main():
     enc = Encoder_TRANSFORMER(**common)
     dec = Decoder_TRANSFORMER(**common)
 
-    # ---- Build rotation2xyz (6dsmpl only) --------------------------------
+    # ---- Build rotation2xyz (rot6d modes) --------------------------------
     rotation2xyz = None
     if args.data_mode == "6dsmpl":
         from model.actor.rotation2xyz import Rotation2xyz
@@ -540,6 +723,9 @@ def main():
         if args.smpl_path:
             r2xyz_kwargs["smpl_path"] = args.smpl_path
         rotation2xyz = Rotation2xyz(device, **r2xyz_kwargs)
+    elif args.data_mode == "h36m_rot6d":
+        from model.actor.h36m_rotation2xyz import H36MRotation2xyz
+        rotation2xyz = H36MRotation2xyz().to(device)
 
     model = ActorCVAE(
         enc, dec,
@@ -549,14 +735,8 @@ def main():
         pose_rep=args.pose_rep,
         num_classes=args.num_classes,
         rotation2xyz=rotation2xyz,
-        use_frame_tokens=not args.no_frame_tokens,
+        use_frame_tokens=args.use_frame_tokens if args.use_frame_tokens else not args.no_frame_tokens,
     ).to(device)
-
-    # ---- Load datasets ---------------------------------------------------
-    if args.data_mode == "6dsmpl":
-        train_ds, val_ds = get_6dsmpl_datasets(args)
-    else:
-        train_ds, val_ds = get_carepd_datasets(args)
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -585,6 +765,10 @@ def main():
         lr_scheduler=args.lr_scheduler,
         lr_step_size=args.lr_step_size,
         lr_gamma=args.lr_gamma,
+        ae_warmup_epochs=args.ae_warmup_epochs,
+        kl_anneal_epochs=args.kl_anneal_epochs,
+        free_nats=args.free_nats,
+        rc_l1=args.rc_l1,
     )
     extra_cb: list[pl.Callback] = []
     # Always save the last-epoch checkpoint so it can be used as an ActorSHAP
@@ -616,8 +800,10 @@ def main():
         phase_tag="actor_cvae",
         find_unused_parameters=False,
         extra_callbacks=extra_cb or None,
+        gradient_clip_val=args.gradient_clip_val,
     )
-    trainer.fit(module, train_loader, val_loader)
+    ckpt_path = getattr(args, "resume_from_checkpoint", None) or None
+    trainer.fit(module, train_loader, val_loader, ckpt_path=ckpt_path)
     print(f"Done. Best checkpoint : {os.path.join(ckpt_dir, 'actor_cvae_best.ckpt')}")
     print(f"      Last checkpoint : {os.path.join(ckpt_dir, 'actor_cvae_last.ckpt')}")
 

@@ -23,6 +23,18 @@ Supported data modes
 
     ACTOR batch dict: ``x: (B, 24, 6, T)``.
 
+``h36m_rot6d``
+    6D rotation representation derived from H36M exponential-map data.
+    The H36M skeleton has 32 joints; each joint's per-frame local rotation
+    is represented as its first two rotation-matrix rows (Zhou et al. 2019).
+
+    NPZ shape per sequence: ``(T, 32, 6)``.
+    ACTOR batch dict: ``x: (B, 32, 6, T)``.
+
+    A differentiable forward-kinematics module (``H36MRotation2xyz``) maps
+    these rotations back to 17-joint root-centred XYZ for the ``rcxyz`` loss
+    and for downstream evaluation.
+
     Rotation values are unit-orthonormal 6D vectors (first two columns of
     a rotation matrix); they are NOT unit quaternions or axis-angles.
 """
@@ -178,6 +190,90 @@ def get_carepd_datasets(args):
     return dataset_factory(p, "motionclip", args.fold)
 
 
+def build_h36m_rot6d_params(
+    dataset_name: str,
+    num_folds: int,
+    batch_size: int,
+    experiment_name: str,
+    *,
+    source_seq_len: int = 81,
+    pose_npz: str | None = None,
+    labels_pkl: str | None = None,
+) -> dict:
+    """Return a param dict for the H36M 6D rotation data loader.
+
+    Uses the ``6D_ROTATIONS`` entry under H36M in const/path.py.
+    """
+    pose_default = path.POSE_AND_LABEL[dataset_name]["6D_ROTATIONS"]["PATH_POSES"]
+    labels_default = path.POSE_AND_LABEL[dataset_name]["6D_ROTATIONS"]["PATH_LABELS"]
+    return {
+        "backbone": "motionclip",
+        "dataset": dataset_name,
+        "data_type": "6D_ROTATIONS",
+        "experiment_name": experiment_name,
+        "in_data_dim": 6,
+        "source_seq_len": source_seq_len,
+        "num_folds": num_folds,
+        "data_centered": False,
+        "merge_last_dim": False,
+        "simulate_confidence_score": False,
+        "data_norm": False,
+        "select_middle": False,
+        "views": [""],
+        "LODO": False,
+        "hypertune": False,
+        "cross_dataset_test": False,
+        "AID": False,
+        "medication": False,
+        "metadata": [],
+        "rotation_range": [-10, 10],
+        "noise_std": 0.0,
+        "mirror_prob": 0.0,
+        "rotation_prob": 0.0,
+        "noise_prob": 0.0,
+        "axis_mask_prob": 0.0,
+        "data_path": [pose_npz or pose_default],
+        "labels_path": labels_pkl or labels_default,
+        "batch_size": batch_size,
+        "dim_rep": 512,
+        "model_checkpoint_path": "",
+    }
+
+
+def get_h36m_rot6d_datasets(args):
+    """Load H36M 6D rotation fold datasets for the given args namespace.
+
+    Returns ``(train_dataset, val_dataset)`` via ``dataset_factory``.
+    The returned batches have shape ``(B, source_seq_len, 32, 6)``.
+    """
+    if args.dataset == "all":
+        raise NotImplementedError("Use a single dataset for ACTOR CVAE debugging.")
+    assert args.dataset in _SUPPORTED, f"Unsupported dataset: {args.dataset}"
+    p = build_h36m_rot6d_params(
+        args.dataset,
+        args.num_folds,
+        args.batch_size,
+        args.experiment_name,
+        source_seq_len=getattr(args, "source_seq_len", 81),
+        pose_npz=getattr(args, "carepd_pose_npz", None),
+        labels_pkl=getattr(args, "carepd_labels_pkl", None),
+    )
+    pose_path = p["data_path"][0]
+    if not os.path.isfile(pose_path):
+        raise FileNotFoundError(
+            f"H36M 6D rotation pose NPZ not found:\n  {pose_path}\n"
+            "Run: python scripts/prepare_h36m_dataset.py\n"
+            "Or pass --carepd_pose_npz /path/to/h36m_rot6d_32j_30f_or_longer.npz"
+        )
+    labels_path = p["labels_path"]
+    if not os.path.isfile(labels_path):
+        raise FileNotFoundError(
+            f"CARE-PD labels pkl not found:\n  {labels_path}\n"
+            "Pass --carepd_labels_pkl /path/to/{dataset}.pkl if it lives elsewhere."
+        )
+    return dataset_factory(p, "motionclip", args.fold)
+
+
 def get_6dsmpl_datasets(args):
     """Load CARE-PD 6D_SMPL fold datasets for the given args namespace.
 
@@ -279,6 +375,47 @@ def actor_batch_from_carepd(
     lengths = pad_mask.sum(dim=-1).long()
     # ACTOR stores motion as (B, njoints, nfeats, nframes)
     x_bjft = x_bttf.permute(0, 2, 3, 1).contiguous()
+    return {
+        "x": x_bjft,
+        "y": y_out,
+        "mask": pad_mask,
+        "lengths": lengths,
+    }
+
+
+H36M_NJOINTS = 32
+
+
+def actor_batch_from_h36m_rot6d(
+    x_btjf: torch.Tensor,
+    pad_mask: torch.Tensor,
+    device: torch.device,
+    y: torch.Tensor | None = None,
+) -> dict:
+    """Convert H36M 6D rotation batch ``(B, T, 32, 6)`` to ACTOR batch dict.
+
+    Args:
+        x_btjf:   ``(B, T, 32, 6)`` float tensor from the H36M 6D loader.
+        pad_mask: ``(B, T)`` bool mask, True = valid (non-padded) frame.
+        device:   target device.
+        y:        optional ``(B,)`` int64 class label tensor.
+
+    Returns:
+        dict with keys ``x``, ``y``, ``mask``, ``lengths``.
+        ``x`` has shape ``(B, 32, 6, T)``.
+    """
+    b, t, j, f = x_btjf.shape
+    assert j == H36M_NJOINTS, f"Expected {H36M_NJOINTS} joints, got {j}"
+    assert f == 6, f"Expected 6 rotation features, got {f}"
+
+    x_bjft = x_btjf.permute(0, 2, 3, 1).contiguous().to(device)  # (B, 32, 6, T)
+    pad_mask = pad_mask.bool().to(device)
+    if y is None:
+        y_out = torch.zeros(b, dtype=torch.long, device=device)
+    else:
+        y_out = y.long().to(device)
+    lengths = pad_mask.sum(dim=-1).long()
+
     return {
         "x": x_bjft,
         "y": y_out,

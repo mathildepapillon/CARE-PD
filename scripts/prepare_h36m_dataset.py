@@ -20,7 +20,9 @@ Usage::
         --output_dir assets/datasets \\
         --sample_rate 2
 
-The script requires no GPU — forward kinematics is done in NumPy.
+Forward kinematics is done in NumPy. Optional ``--rot6d-backend carepd`` encodes
+per-joint 6D rotations with PyTorch using the same axis-angle → Zhou 6D chain as
+``preprocessing_utils.get_6D_rep_from_24x3_pose`` (SMPL 6D pipeline).
 """
 
 from __future__ import annotations
@@ -31,6 +33,10 @@ import pickle
 import sys
 
 import numpy as np
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # ---------------------------------------------------------------------------
 # H36M skeleton constants (from GGMotion / una-dinosauria)
@@ -136,9 +142,52 @@ def expmap_to_xyz_17(raw_frames: np.ndarray, parent, offset, expmap_ind) -> np.n
     for t in range(T):
         xyz_32[t] = _fk_numpy(raw_frames[t], parent, offset, expmap_ind)
     xyz_17 = xyz_32[:, H36M_32_TO_17, :]
-    # H36M FK output is in millimeters; convert to meters.
     xyz_17 = xyz_17 / 1000.0
     return xyz_17.astype(np.float32)
+
+
+def _joint_expmaps_T32x3(raw_frames: np.ndarray, expmap_ind) -> np.ndarray:
+    """Stack per-joint exponential-map vectors: (T, 99) → (T, 32, 3)."""
+    return np.stack([raw_frames[:, expmap_ind[j]] for j in range(32)], axis=1)
+
+
+def expmap_to_rot6d_32(
+    raw_frames: np.ndarray,
+    expmap_ind,
+    *,
+    backend: str = "numpy",
+) -> np.ndarray:
+    """Convert (T, 99) exp-map sequence to (T, 32, 6) Zhou 6D rotations.
+
+    Each joint's 3-D exponential map is treated as an axis-angle vector.
+
+    backend:
+      - ``numpy`` (default): Rodrigues ``_expmap2rotmat``, then first two rows
+        (legacy, matches previously released NPZ files).
+      - ``carepd``: PyTorch ``axis_angle_to_matrix`` → ``matrix_to_rotation_6d``
+        from ``data.preprocessing.preprocessing_utils`` — the same chain as
+        SMPL ``get_6D_rep_from_24x3_pose`` / ACTOR-style 6D.
+    """
+    if backend == "numpy":
+        T = raw_frames.shape[0]
+        rot6d = np.zeros((T, 32, 6), dtype=np.float32)
+        for t in range(T):
+            for j in range(32):
+                R = _expmap2rotmat(raw_frames[t, expmap_ind[j]])
+                rot6d[t, j] = R[:2, :].flatten()
+        return rot6d
+
+    if backend == "carepd":
+        import torch
+        from data.preprocessing.preprocessing_utils import axis_angle_to_rotation_6d
+
+        vecs = _joint_expmaps_T32x3(raw_frames, expmap_ind)
+        aa = torch.as_tensor(vecs, dtype=torch.float64)
+        d6 = axis_angle_to_rotation_6d(aa)
+        # Avoid .numpy() when PyTorch is built without NumPy ABI (use tolist).
+        return np.asarray(d6.float().detach().cpu().tolist(), dtype=np.float32)
+
+    raise ValueError(f"backend must be 'numpy' or 'carepd', got {backend!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +236,20 @@ def main():
                     help="Frame sub-sampling rate (2 = 50fps→25fps).")
     ap.add_argument("--min_frames", type=int, default=30,
                     help="Discard sequences shorter than this after down-sampling.")
+    ap.add_argument(
+        "--rot6d-backend",
+        choices=("numpy", "carepd"),
+        default="numpy",
+        help="exp-map → Zhou 6D: numpy=Rodrigues (legacy NPZ); carepd=PyTorch SMPL 6D chain.",
+    )
     args = ap.parse_args()
+
+    print(f"rot6d backend: {args.rot6d_backend}")
 
     parent, offset, expmap_ind = _h36m_skeleton_variables()
 
     pose_dict: dict[str, np.ndarray] = {}
+    rot6d_dict: dict[str, np.ndarray] = {}
     labels_dict: dict[str, int] = {}
     participant_for_seq: dict[str, str] = {}
     action_for_seq: dict[str, str] = {}
@@ -229,7 +287,13 @@ def main():
                 # Downsample.
                 raw = raw[::args.sample_rate]
 
-                # Zero out global translation and rotation (first 6 dims).
+                # Canonicalise: clear the first six components (global translation
+                # in indices 0–2 and the joint-0 exponential map in 3–5; the
+                # latter matches the usual "global orientation" block in this
+                # 99-D layout).  That forces identity root rotation, so forward
+                # kinematics yields a fixed pelvis and fixed hip joint positions
+                # over time — see tests/test_h36m_pipeline_e2e.py
+                # (TestDataProperties.test_per_joint_motion_breakdown).
                 raw[:, :6] = 0.0
 
                 xyz_17 = expmap_to_xyz_17(raw, parent, offset, expmap_ind)
@@ -240,26 +304,38 @@ def main():
                     total_skipped += 1
                     continue
 
+                rot6d_32 = expmap_to_rot6d_32(
+                    raw, expmap_ind, backend=args.rot6d_backend
+                )
+
                 seq_name = f"S{subj}__{action}_{trial}"
                 pose_dict[seq_name] = xyz_17
+                rot6d_dict[seq_name] = rot6d_32
                 labels_dict[seq_name] = action_to_label[action]
                 participant_for_seq[seq_name] = f"S{subj}"
                 action_for_seq[seq_name] = action
                 total_kept += 1
                 print(f"  OK  S{subj}/{action}_{trial}  "
                       f"raw={n_raw}→{xyz_17.shape[0]} frames  "
-                      f"shape={xyz_17.shape}")
+                      f"xyz={xyz_17.shape}  rot6d={rot6d_32.shape}")
 
     print(f"\nTotal: {total_kept} sequences kept, {total_skipped} skipped")
     print(f"Actions kept ({n_classes}): {kept_actions}")
     print(f"Subjects: {sorted(set(participant_for_seq.values()))}")
 
-    # ---- Save NPZ ----------------------------------------------------------
+    # ---- Save XYZ NPZ ------------------------------------------------------
     h36m_dir = os.path.join(args.output_dir, "h36m", "H36M")
     os.makedirs(h36m_dir, exist_ok=True)
     npz_path = os.path.join(h36m_dir, "h36m_3d_world_floorXZZplus_30f_or_longer.npz")
     np.savez(npz_path, **pose_dict)
-    print(f"\nSaved pose NPZ → {npz_path}")
+    print(f"\nSaved XYZ pose NPZ → {npz_path}")
+
+    # ---- Save 6D rotation NPZ ---------------------------------------------
+    rot6d_dir = os.path.join(args.output_dir, "6D_ROTATIONS", "H36M")
+    os.makedirs(rot6d_dir, exist_ok=True)
+    rot6d_path = os.path.join(rot6d_dir, "h36m_rot6d_32j_30f_or_longer.npz")
+    np.savez(rot6d_path, **rot6d_dict)
+    print(f"Saved 6D rotation NPZ → {rot6d_path}")
 
     # ---- Save labels pickle ------------------------------------------------
     # Structure matches what H36MReader expects: {seq_name: label_int}.

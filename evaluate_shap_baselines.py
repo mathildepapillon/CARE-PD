@@ -120,6 +120,7 @@ def evaluate_sequence(
     classifier_fn = build_classifier_fn(
         motion_encoder, mask, backbone_name,
         zscore_mean=zscore_mean, zscore_std=zscore_std,
+        x_orig=x,
     )
 
     if physics_completer is not None and subject_id is not None:
@@ -214,19 +215,34 @@ def evaluate_sequence(
         seed=seq_idx,
     )
 
+    t_shap_physics = None
+    if physics_completer is not None:
+        print(f'  [seq {seq_idx}] temporal SHAP (physics, K=4 windows, exact) …')
+        t_shap_physics = compute_temporal_shap_baseline(
+            'physics', classifier_fn, x, y, mask, lengths,
+            window_assignments=window_assignments,
+            physics_completer=physics_completer,
+            n_marginal_samples=physics_n_samples,
+            seed=seq_idx,
+        )
+
     print(f'  [seq {seq_idx}] temporal faithfulness metrics (batched) …')
     t_methods = {
-        'zero':     (t_shap_zero,     None,        None),
-        'mean':     (t_shap_mean,     joint_means, None),
-        'marginal': (t_shap_marginal, None,        train_pool),
+        'zero':     (t_shap_zero,     None,        None,        None),
+        'mean':     (t_shap_mean,     joint_means, None,        None),
+        'marginal': (t_shap_marginal, None,        train_pool,  None),
     }
+    if t_shap_physics is not None:
+        t_methods['physics'] = (t_shap_physics, None, None, physics_completer)
+
     t_faithfulness = {}
-    for m_name, (t_shap, jm, tp) in t_methods.items():
+    for m_name, (t_shap, jm, tp, pcomp) in t_methods.items():
         t_window_names = [k for k in t_shap if not k.startswith('_')]
         del_ins = _temporal_deletion_insertion_auc_batched(
-            classifier_fn, x, y, window_assignments, t_shap, m_name,
-            joint_means=jm, train_pool=tp, seed=seq_idx,
-            n_marginal_samples=n_completions,
+            classifier_fn, x, y, mask, lengths, window_assignments, t_shap, m_name,
+            joint_means=jm, train_pool=tp, physics_completer=pcomp,
+            seed=seq_idx,
+            n_marginal_samples=n_completions if m_name != 'physics' else physics_n_samples,
         )
         comp_err = compute_shapley_completeness(
             t_shap, t_shap['_v_full'], t_shap['_v_empty'],
@@ -265,6 +281,10 @@ def evaluate_sequence(
             'zero':     {k: float(v) for k, v in t_shap_zero.items()},
             'mean':     {k: float(v) for k, v in t_shap_mean.items()},
             'marginal': {k: float(v) for k, v in t_shap_marginal.items()},
+            **(
+                {'physics': {k: float(v) for k, v in t_shap_physics.items()}}
+                if t_shap_physics is not None else {}
+            ),
         },
         'temporal_faithfulness': t_faithfulness,
     }
@@ -283,7 +303,10 @@ def aggregate_results(per_seq: list[dict]) -> dict:
     # Detect which spatial methods are present (always includes zero/mean/marginal,
     # optionally includes physics when --physics_stats was provided).
     spatial_methods = list(per_seq[0]['faithfulness'].keys()) if per_seq else list(_BASELINE_METHODS)
-    temporal_methods = list(_BASELINE_METHODS)
+    temporal_methods = (
+        list(per_seq[0]['temporal_faithfulness'].keys()) if per_seq
+        else list(_BASELINE_METHODS)
+    )
 
     for r in per_seq:
         agg['p_full'].append(r['p_full'])
@@ -384,13 +407,14 @@ def main() -> None:
     # Physics-informed baseline (optional — two mutually exclusive modes)
     parser.add_argument('--physics_stats', default=None,
                         help='Path to motion_stats_fold*.pkl from compute_motion_stats.py. '
-                             'Runs physics SHAP live (slow). Mutually exclusive with '
-                             '--physics_cache_dir.')
+                             'Loads PhysicsInformedCompleter for physics temporal SHAP and/or '
+                             'live physics spatial SHAP. May be combined with --physics_cache_dir '
+                             '(cache supplies pre-computed spatial physics JSONs).')
     parser.add_argument('--physics_cache_dir', default=None,
                         help='Directory of pre-computed JSON files from '
-                             'scripts/precompute_physics_shap.py. '
-                             'Loads results instantly — no completer needed. '
-                             'Mutually exclusive with --physics_stats.')
+                             'scripts/precompute_physics_shap.py '
+                             '(spatial SHAP + faithfulness). For temporal physics, also pass '
+                             '--physics_stats.')
     parser.add_argument('--physics_n_kernel_samples', type=int, default=500,
                         help='KernelSHAP coalition pairs for the physics method '
                              '(only used with --physics_stats, not --physics_cache_dir).')
@@ -399,8 +423,8 @@ def main() -> None:
                              '(only used with --physics_stats).')
     args = parser.parse_args()
 
-    if args.physics_stats and args.physics_cache_dir:
-        parser.error("--physics_stats and --physics_cache_dir are mutually exclusive.")
+    # Both may be set: cache supplies pre-computed *spatial* physics; stats file
+    # instantiates PhysicsInformedCompleter for temporal physics (and live spatial).
 
     device = torch.device(args.device)
 
@@ -454,7 +478,7 @@ def main() -> None:
     else:
         zscore_mean = zscore_std = None
 
-    # Physics completer — live mode (--physics_stats) or cache mode (--physics_cache_dir).
+    # Physics completer (--physics_stats) and/or spatial cache (--physics_cache_dir).
     physics_completer = None
     physics_cache: dict[int, dict] = {}   # seq_idx → pre-loaded record
 
@@ -463,7 +487,7 @@ def main() -> None:
         physics_completer = load_physics_completer(args.physics_stats, device)
         print(f'  physics baseline: n_kernel={args.physics_n_kernel_samples}  '
               f'n_samples={args.physics_n_samples}')
-    elif args.physics_cache_dir:
+    if args.physics_cache_dir:
         import glob as _glob, json as _json
         cache_files = sorted(_glob.glob(os.path.join(args.physics_cache_dir, 'seq_*.json')))
         for cf in cache_files:
@@ -582,8 +606,12 @@ def main() -> None:
         return e.get('mean', float('nan')), e.get('std', float('nan'))
 
     # --- Spatial SHAP ---
+    _has_phys_spatial = (
+        physics_completer is not None
+        or (per_seq_results and 'physics' in per_seq_results[0].get('faithfulness', {}))
+    )
     spatial_methods_present = list(
-        dict.fromkeys(list(_BASELINE_METHODS) + (['physics'] if physics_completer else []))
+        dict.fromkeys(list(_BASELINE_METHODS) + (['physics'] if _has_phys_spatial else []))
     )
     print('  Spatial SHAP (KernelSHAP, 17 joints):')
     print(f'  {"Method":<10}  {"Del-AUC":>10}  {"Ins-AUC":>10}  {"PGI@1":>8}  {"PGU@1":>8}  {"Comp.Err":>10}')
@@ -603,7 +631,9 @@ def main() -> None:
     print('\n  Temporal SHAP (exact, K=4 stride windows):')
     print(f'  {"Method":<10}  {"Del-AUC":>10}  {"Ins-AUC":>10}  {"Comp.Err":>10}')
     print(f'  {"-"*10}  {"-"*10}  {"-"*10}  {"-"*10}')
-    for method in _BASELINE_METHODS:
+    for method in ('zero', 'mean', 'marginal', 'physics'):
+        if f'temporal/{method}/deletion_auc' not in agg:
+            continue
         dm, ds = _get(f'temporal/{method}/deletion_auc')
         im, is_ = _get(f'temporal/{method}/insertion_auc')
         cm, cs = _get(f'temporal/{method}/completeness_error')

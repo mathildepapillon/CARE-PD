@@ -9,7 +9,7 @@ from __future__ import annotations
 import importlib
 import os
 from argparse import Namespace
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -246,6 +246,7 @@ def build_classifier_fn(
     backbone_name: str,
     zscore_mean: Optional[torch.Tensor] = None,
     zscore_std: Optional[torch.Tensor] = None,
+    x_orig: Optional[torch.Tensor] = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Wrap MotionEncoder as ``f(x: (1,J,F,T)) → logits (1,C)``.
 
@@ -260,12 +261,34 @@ def build_classifier_fn(
         backbone_name:  Backbone identifier for projection dispatch.
         zscore_mean:    ``(J, F)`` z-score mean — required for POTR.
         zscore_std:     ``(J, F)`` z-score std  — required for POTR.
+        x_orig:         ``(1, J, F, T)`` original (unmasked) sequence in
+                        global-pelvis format.  When provided, joint 0 (the
+                        global pelvis trajectory) is restored from this
+                        reference before calling ``unroot_to_global``.  This
+                        ensures that SHAP coalition masking affects only
+                        relative joint poses, not the global walking
+                        translation.  Without this, zeroed / mean-imputed
+                        frames land at world origin which after perspective
+                        projection maps to screen coordinates the classifier
+                        never saw during training, causing near-chance
+                        ``p_full`` for 2-D backbones (MixSTE, PoseFormerV2)
+                        and distorted crop-scale bounding boxes for
+                        MotionBERT / MotionAGFormer.  POTR is unaffected
+                        because its projection subtracts joint-0 internally.
     """
     @torch.no_grad()
     def _fn(x_actor: torch.Tensor) -> torch.Tensor:
         B = x_actor.shape[0]
         # Expand (1, T) mask to (B, T) so batched classifier calls work correctly.
         pad_mask_b = mask.expand(B, -1) if B > 1 else mask
+
+        # Restore the original pelvis trajectory so coalition masking only
+        # perturbs relative joint poses, not the global walking path.
+        if x_orig is not None:
+            x_actor = x_actor.clone()
+            pelvis_orig = x_orig[:, 0:1, :, :]                    # (1, 1, F, T)
+            x_actor[:, 0:1, :, :] = pelvis_orig.expand(B, -1, -1, -1)
+
         # Recover full global 3D from global-pelvis ACTOR format before projection.
         # x_actor: (B, J, F, T) → permute to (B, T, J, F) → unroot → permute back.
         x_btjf = x_actor.permute(0, 3, 1, 2)          # (B, T, J, F)
@@ -398,16 +421,19 @@ def _temporal_deletion_insertion_auc_batched(
     classifier_fn: Callable,
     x: torch.Tensor,
     y: torch.Tensor,
+    mask: torch.Tensor,
+    lengths: torch.Tensor,
     window_assignments: list[list[int]],
     temporal_shap_vals: dict,
     method: str,
     joint_means: Optional[torch.Tensor] = None,
     train_pool: Optional[torch.Tensor] = None,
+    physics_completer: Optional[Any] = None,
     seed: int = 0,
     n_marginal_samples: int = 20,
     chunk_size: int = 256,
 ) -> dict:
-    """Batched temporal deletion/insertion AUC for zero/mean/marginal.
+    """Batched temporal deletion/insertion AUC for zero/mean/marginal/physics.
 
     Replaces ``_temporal_deletion_insertion_auc`` by building all
     perturbations upfront and classifying them in a single batched GPU call.
@@ -415,6 +441,7 @@ def _temporal_deletion_insertion_auc_batched(
     classified together instead of one at a time.
     """
     from model.actor.shap_compute import _classify_chunked
+    from model.actor.shap_masking import build_temporal_shap_mask
 
     K = len(window_assignments)
     T = x.shape[-1]
@@ -487,10 +514,40 @@ def _temporal_deletion_insertion_auc_batched(
             all_probs[ci] = raw_probs[pos : pos + n].mean()
             pos += n
 
+    elif method == "physics":
+        if physics_completer is None:
+            raise ValueError("physics_completer is required for method='physics'")
+        input_parts: list[torch.Tensor] = []
+        meta_ph: list[tuple[int, int]] = []
+        for ci, masked_idxs in enumerate(configs):
+            if not masked_idxs:
+                input_parts.append(x)
+                meta_ph.append((ci, 1))
+            else:
+                observed_windows = [k for k in range(K) if k not in masked_idxs]
+                cm = build_temporal_shap_mask(
+                    observed_windows, window_assignments, T, device,
+                ).unsqueeze(0)
+                comps = physics_completer.sample_completions(
+                    x, y, mask, lengths, cm, n_samples=n_marginal_samples,
+                )
+                x_rep = torch.cat(comps, dim=0)
+                input_parts.append(x_rep)
+                meta_ph.append((ci, n_marginal_samples))
+        x_all = torch.cat(input_parts, dim=0)
+        raw_probs = _classify_chunked(
+            classifier_fn, x_all, class_idx, chunk_size=chunk_size,
+        )
+        all_probs = np.zeros(len(configs))
+        pos = 0
+        for ci, n in meta_ph:
+            all_probs[ci] = raw_probs[pos : pos + n].mean()
+            pos += n
+
     else:
         raise ValueError(
-            f"Temporal batched method must be 'zero', 'mean', or "
-            f"'marginal'; got {method!r}"
+            f"Temporal batched method must be 'zero', 'mean', 'marginal', or "
+            f"'physics'; got {method!r}"
         )
 
     del_curve = all_probs[: K + 1].tolist()

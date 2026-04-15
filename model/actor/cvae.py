@@ -50,6 +50,7 @@ import torch
 import torch.nn as nn
 
 from model.actor.losses import get_loss_function
+from model.actor.h36m_rotation2xyz import h36m_vel_joint_weights
 
 
 class ActorCVAE(nn.Module):
@@ -104,6 +105,14 @@ class ActorCVAE(nn.Module):
                 "callable.  Pass rotation2xyz=Rotation2xyz(device) to ActorCVAE."
             )
 
+        # Per-joint velocity weights: concentrate vel gradient on dynamic joints.
+        if pose_rep == "rot6d" and encoder.njoints == 32:
+            self.register_buffer(
+                "vel_joint_weights", h36m_vel_joint_weights(32),
+            )
+        else:
+            self.vel_joint_weights = None
+
         self.losses = list(self.lambdas.keys()) + ["mixed"]
 
     # ------------------------------------------------------------------
@@ -111,8 +120,17 @@ class ActorCVAE(nn.Module):
     # ------------------------------------------------------------------
 
     def reparameterize(self, batch: dict, seed: int | None = None) -> torch.Tensor:
-        """Sample latent z ~ N(mu, exp(logvar)) via the reparameterisation trick."""
+        """Sample latent z ~ N(mu, exp(logvar)) via the reparameterisation trick.
+
+        When ``batch["_ae_deterministic"]`` is True, returns ``mu`` directly
+        (autoencoder warmup — no KL noise).
+
+        ``batch["_noise_scale"]`` (float, 0-1) can be set to linearly
+        interpolate between deterministic (0) and full stochastic (1).
+        """
         mu, logvar = batch["mu"], batch["logvar"]
+        if batch.get("_ae_deterministic", False):
+            return mu
         std = torch.exp(0.5 * logvar)
         if seed is None:
             eps = torch.randn_like(std)
@@ -120,7 +138,8 @@ class ActorCVAE(nn.Module):
             gen = torch.Generator(device=mu.device)
             gen.manual_seed(seed)
             eps = torch.randn(std.shape, device=mu.device, generator=gen)
-        return eps * std + mu
+        noise_scale = batch.get("_noise_scale", 1.0)
+        return mu + noise_scale * eps * std
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -171,6 +190,8 @@ class ActorCVAE(nn.Module):
             losses: dict of individual loss values (detached floats) including
                     ``"mixed"`` for logging.
         """
+        if self.vel_joint_weights is not None:
+            batch["vel_joint_weights"] = self.vel_joint_weights
         x0 = batch["x"]
         mixed = torch.zeros((), device=x0.device, dtype=x0.dtype)
         losses: dict[str, float] = {}

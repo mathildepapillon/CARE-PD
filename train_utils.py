@@ -17,6 +17,7 @@ def make_trainer(
     extra_callbacks: list | None = None,
     find_unused_parameters: bool = False,
     save_last_only: bool = False,
+    gradient_clip_val: float = 1.0,
 ) -> pl.Trainer:
     """Build a pl.Trainer with DDP (if >1 GPU), checkpointing, and logging.
 
@@ -77,7 +78,7 @@ def make_trainer(
         strategy=strategy,
         logger=logger,
         callbacks=callbacks,
-        gradient_clip_val=1.0,
+        gradient_clip_val=gradient_clip_val,
         log_every_n_steps=1,
         enable_progress_bar=True,
     )

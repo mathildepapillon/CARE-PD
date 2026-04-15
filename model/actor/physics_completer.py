@@ -211,7 +211,8 @@ class PhysicsInformedCompleter:
         y              : (1,) UPDRS class label tensor.
         mask           : (1, T) bool pad mask (True = valid frame).
         lengths        : (1,) sequence lengths.
-        coalition_mask : (1, 17) bool, True = joint is observed.
+        coalition_mask : (1, 17) bool for spatial SHAP (True = joint observed), or
+                           (1, T) bool for temporal SHAP (True = frame observed).
         n_samples      : K, number of completions to draw.
         paste_observed : if True, overwrite held-out joints with GT values
                          (standard SHAP behaviour).
@@ -229,9 +230,17 @@ class PhysicsInformedCompleter:
         assert B == 1, "PhysicsInformedCompleter only supports batch size 1."
         T = int(lengths[0].item())   # valid frames
 
+        cm0 = coalition_mask[0]
+        # Temporal SHAP: mask width matches time dimension (not 17 joints).
+        if cm0.shape[0] == T_raw and cm0.shape[0] != J:
+            return self._sample_completions_temporal_frames(
+                x, y, mask, lengths, coalition_mask,
+                n_samples, paste_observed, subject_id,
+            )
+
         # (T, 17, 3) global-pelvis float64
         x_gp = x[0].permute(2, 0, 1).cpu().numpy().astype(np.float64)[:T]
-        cm = coalition_mask[0].cpu().numpy().astype(bool)   # (17,) observed flags
+        cm = cm0.cpu().numpy().astype(bool)   # (17,) observed flags
         updrs_class = int(y[0].item())
 
         # Subject lookup
@@ -309,6 +318,133 @@ class PhysicsInformedCompleter:
             ).to(self._device)
             completions.append(out_t)
 
+        return completions
+
+    @torch.no_grad()
+    def _sample_completions_temporal_frames(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+        lengths: torch.Tensor,
+        coalition_mask: torch.Tensor,
+        n_samples: int,
+        paste_observed: bool,
+        subject_id: Optional[str],
+    ) -> list[torch.Tensor]:
+        """Temporal masking: (1, T) coalition_mask, True = frame observed (all joints)."""
+        B, J, Fj, T_raw = x.shape
+        assert B == 1 and J == 17 and Fj == 3
+        T_valid = int(lengths[0].item())
+        updrs_class = int(y[0].item())
+        sid = subject_id or self._subject_id
+        stats = self._get_stats(sid, updrs_class)
+
+        frame_obs = coalition_mask[0].cpu().numpy().astype(bool).copy()
+        if frame_obs.shape[0] != T_raw:
+            raise ValueError(
+                f"Temporal coalition_mask length {frame_obs.shape[0]} != x width {T_raw}",
+            )
+        frame_obs[T_valid:] = True
+
+        x_gp = x[0].permute(2, 0, 1).cpu().numpy().astype(np.float64)[:T_valid]
+        x_body = x_gp[:, 1:, :].reshape(T_valid, N_BODY)
+        x_pelvis = x_gp[:, 0, :].copy()
+        mean_body = stats["mean_body"].astype(np.float64)
+        lag_cov = stats["lag_cov"].astype(np.float64)
+
+        taper = _taper_weights(T_valid)
+        n_lag = min(lag_cov.shape[0] - 1, T_valid - 1) + 1
+        lag_cov_T = lag_cov[:n_lag]
+        feat_all = np.arange(N_BODY, dtype=np.int64)
+        sigma_full = _build_sym_block(lag_cov_T, feat_all, T_valid, taper)
+        sigma_full += _EPS_PD * np.eye(T_valid * N_BODY)
+
+        mu_flat = np.tile(mean_body, T_valid)
+        x_flat = x_body.reshape(T_valid * N_BODY)
+
+        idx_obs: list[int] = []
+        idx_held: list[int] = []
+        for t in range(T_valid):
+            base = t * N_BODY
+            if frame_obs[t]:
+                idx_obs.extend(range(base, base + N_BODY))
+            else:
+                idx_held.extend(range(base, base + N_BODY))
+
+        idx_obs = np.array(idx_obs, dtype=np.int64)
+        idx_held = np.array(idx_held, dtype=np.int64)
+
+        rng = np.random.default_rng()
+
+        def _draw_body_batch() -> np.ndarray:
+            if idx_held.size == 0:
+                return np.tile(x_body[np.newaxis], (n_samples, 1, 1))
+            if idx_obs.size == 0:
+                mu_h = mu_flat[idx_held]
+                s_hh = sigma_full[np.ix_(idx_held, idx_held)]
+                s_hh = 0.5 * (s_hh + s_hh.T) + _EPS_PD * np.eye(len(idx_held))
+                try:
+                    l_h = cholesky(s_hh, lower=True, check_finite=False)
+                except np.linalg.LinAlgError:
+                    l_h = np.diag(np.sqrt(np.maximum(np.diag(s_hh), _EPS_PD)))
+                z = rng.standard_normal((len(idx_held), n_samples))
+                draws_flat = mu_h[:, np.newaxis] + l_h @ z
+            else:
+                mu_o = mu_flat[idx_obs]
+                mu_h = mu_flat[idx_held]
+                s_oo = sigma_full[np.ix_(idx_obs, idx_obs)]
+                s_oo = 0.5 * (s_oo + s_oo.T) + _EPS_PD * np.eye(len(idx_obs))
+                s_ho = sigma_full[np.ix_(idx_held, idx_obs)]
+                x_o = x_flat[idx_obs]
+                l_fac = cho_factor(s_oo, lower=True, check_finite=False)
+                dev_o = x_o - mu_o
+                cond_mean = mu_h + s_ho @ cho_solve(l_fac, dev_o)
+                s_hh = sigma_full[np.ix_(idx_held, idx_held)]
+                s_hh = 0.5 * (s_hh + s_hh.T) + _EPS_PD * np.eye(len(idx_held))
+                k_mat = cho_solve(l_fac, s_ho.T)
+                cond_cov = s_hh - s_ho @ k_mat
+                cond_cov = 0.5 * (cond_cov + cond_cov.T) + _EPS_PD * np.eye(len(idx_held))
+                try:
+                    l_c = cholesky(cond_cov, lower=True, check_finite=False)
+                except np.linalg.LinAlgError:
+                    l_c = np.diag(np.sqrt(np.maximum(np.diag(cond_cov), _EPS_PD)))
+                z = rng.standard_normal((len(idx_held), n_samples))
+                draws_flat = cond_mean[:, np.newaxis] + l_c @ z
+
+            body_samples = np.tile(x_body[np.newaxis], (n_samples, 1, 1))
+            for si in range(n_samples):
+                body_samples[si].reshape(-1)[idx_held] = draws_flat[:, si]
+            return body_samples
+
+        body_samples = _draw_body_batch()
+
+        obs_frames = frame_obs[:T_valid]
+        cm_body = np.ones(J_BODY, dtype=bool)
+        body_samples = self._biomech_project(
+            body_samples, x_body, cm_body, stats, observed_frames=obs_frames,
+        )
+
+        pelvis_samples = self._sample_pelvis_temporal(
+            x_pelvis, obs_frames, stats, n_samples, T_valid, rng,
+        )
+
+        completions: list[torch.Tensor] = []
+        for k in range(n_samples):
+            x_comp = np.zeros((T_valid, 17, 3), dtype=np.float32)
+            x_comp[:, 0, :] = pelvis_samples[k]
+            x_comp[:, 1:, :] = body_samples[k].reshape(T_valid, J_BODY, F_FEAT)
+            if paste_observed:
+                fo = obs_frames
+                x_comp[fo, :] = x_gp[fo, :].astype(np.float32)
+            out_np = np.zeros((T_raw, 17, 3), dtype=np.float32)
+            out_np[:T_valid] = x_comp
+            if T_valid < T_raw:
+                out_np[T_valid:] = x_comp[-1]
+            out_t = torch.from_numpy(
+                out_np.transpose(1, 2, 0)[np.newaxis],
+            ).to(self._device)
+            completions.append(out_t)
         return completions
 
     # ------------------------------------------------------------------
@@ -475,6 +611,47 @@ class PhysicsInformedCompleter:
     # Pelvis handling
     # ------------------------------------------------------------------
 
+    def _sample_pelvis_temporal(
+        self,
+        x_pelvis: np.ndarray,
+        frame_obs: np.ndarray,
+        stats: dict,
+        n_samples: int,
+        T: int,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Pelvis trajectories when some frames are masked (temporal SHAP)."""
+        k_out = np.zeros((n_samples, T, 3), dtype=np.float64)
+        t_obs = np.where(frame_obs)[0]
+        t_msk = np.where(~frame_obs)[0]
+        if t_msk.size == 0:
+            return np.tile(x_pelvis[np.newaxis], (n_samples, 1, 1))
+        if t_obs.size == 0:
+            return self._sample_pelvis(
+                x_pelvis, False, stats, n_samples, T,
+            )
+        for k in range(n_samples):
+            traj = x_pelvis.copy()
+            for t in t_msk:
+                left = t_obs[t_obs < t]
+                right = t_obs[t_obs > t]
+                if left.size and right.size:
+                    a, b = int(left[-1]), int(right[0])
+                    w = (t - a) / max(b - a, 1)
+                    traj[t] = (1 - w) * x_pelvis[a] + w * x_pelvis[b]
+                elif left.size:
+                    a = int(left[-1])
+                    traj[t] = x_pelvis[a]
+                elif right.size:
+                    b = int(right[0])
+                    traj[t] = x_pelvis[b]
+                else:
+                    traj[t] = x_pelvis[t]
+            noise = rng.standard_normal((T, 3)) * float(stats.get("pelvis_vel_p99", 0.01)) * 0.05
+            traj = traj + noise
+            k_out[k] = traj
+        return k_out
+
     def _sample_pelvis(
         self,
         x_pelvis: np.ndarray,   # (T, 3) observed pelvis (if observed)
@@ -516,9 +693,12 @@ class PhysicsInformedCompleter:
         cm_body: np.ndarray,         # (16,) bool, True = joint observed
         stats: dict,
         n_iters: int = 2,
+        observed_frames: Optional[np.ndarray] = None,
     ) -> np.ndarray:                 # (K, T, 48)
-        """Apply bone-length correction and velocity clamping to sampled body."""
+        """Apply bone-length correction and velocity clamping to sampled body.
 
+        If ``observed_frames`` is (T,) bool, True = GT frame (skip correction).
+        """
         bone_mean = stats["bone_mean"].astype(np.float64)   # (16,)
         bone_std  = stats["bone_std"].astype(np.float64)    # (16,)
         vel_p99   = stats["vel_p99_body"].astype(np.float64)  # (16,)
@@ -559,6 +739,8 @@ class PhysicsInformedCompleter:
                     error = np.abs(current_len - target)           # (T, 1)
                     # Correct frames where error exceeds tolerance
                     needs_fix = (error > tol).squeeze(-1)          # (T,) bool
+                    if observed_frames is not None:
+                        needs_fix = needs_fix & (~observed_frames)
 
                     if needs_fix.any():
                         if parent == 0:
@@ -578,6 +760,9 @@ class PhysicsInformedCompleter:
                     if max_speed <= 0:
                         continue
                     over = speeds[:, j] > max_speed           # (T-1,) bool
+                    if observed_frames is not None:
+                        obs_pair = observed_frames[:-1] & observed_frames[1:]
+                        over = over & (~obs_pair)
                     if over.any():
                         scale = max_speed / np.maximum(speeds[over, j], 1e-8)
                         vel[over, j, :] *= scale[:, np.newaxis]
