@@ -29,9 +29,10 @@ Recommended runs:
 * ``--imputation marginal`` — each joint is replaced by real donor samples
   from the training pool. On-manifold, but not any method's native
   reference ⇒ equally "foreign" to zero-/mean-/flow-SHAP.
-* ``--imputation actor`` — joints are filled with completions drawn from an
-  ActorSHAP CVAE, a learned motion prior. Also on-manifold; disfavoured by
-  methods whose rankings were fit to very different counterfactuals.
+* ``--imputation flow_imputer`` — joints are filled with RePaint-style
+  conditional samples from the trained flow-matching velocity net
+  (:class:`model.flow_shap.imputer.FlowImputer`). Also on-manifold and is
+  OTFlow-SHAP's semantic home turf.
 * ``--imputation zero`` — zero imputation, useful as a reference row.
 
 Outputs ``per_sequence.jsonl`` + ``aggregate.json`` with a ``faithfulness``
@@ -158,7 +159,7 @@ def _compute_p_ref(
     *,
     joint_means: torch.Tensor | None,
     train_pool: torch.Tensor | None,
-    actor_shap,
+    flow_imputer,
     mask: torch.Tensor,
     lengths: torch.Tensor,
     n_samples: int,
@@ -194,12 +195,12 @@ def _compute_p_ref(
             probs.append(_class_prob(classifier_fn, d[None], class_idx))
         return float(np.mean(probs))
 
-    if imputation == "actor":
-        assert actor_shap is not None
+    if imputation == "flow_imputer":
+        assert flow_imputer is not None
         J = x.shape[1]
         empty = torch.zeros(1, J, dtype=torch.bool, device=device)
         y_tensor = torch.tensor([class_idx], device=device, dtype=torch.long)
-        comps = actor_shap.sample_completions(
+        comps = flow_imputer.sample_completions(
             x, y_tensor, mask, lengths, empty, n_samples=n_samples,
         )
         probs = []
@@ -211,18 +212,65 @@ def _compute_p_ref(
     raise ValueError(f"unknown imputation {imputation!r}")
 
 
-def _maybe_load_actor_shap(args, device):
-    if args.imputation != "actor":
+def _maybe_load_flow_imputer(args, device):
+    """Instantiate a :class:`FlowImputer` when ``--imputation flow_imputer``.
+
+    Reads z-score stats from the training flow cache so inputs in
+    classifier-native space are normalised into flow space before the ODE
+    and de-normalised on the way out, matching the pipeline used by
+    :mod:`scripts.compute_flow_shap_imputer`.
+    """
+    if args.imputation != "flow_imputer":
         return None
-    if not args.actor_ckpt:
+    if not args.flow_config:
         raise ValueError(
-            "--actor_ckpt is required when --imputation actor. "
-            "Pass the path to an actor_shap *.ckpt (Lightning)."
+            "--flow_config is required when --imputation flow_imputer."
         )
-    # Reuse the loader already wired up in ``evaluate_shap.py``.
+    if not args.flow_checkpoint:
+        raise ValueError(
+            "--flow_checkpoint is required when --imputation flow_imputer."
+        )
+
     sys.path.insert(0, str(PROJECT_ROOT))
-    from evaluate_shap import load_actor_shap  # noqa: E402
-    return load_actor_shap(args.actor_ckpt, device, config_path=args.actor_config)
+    from model.flow_shap import FlowImputer  # noqa: E402
+    from scripts.compute_flow_shap import _load_velocity_net  # noqa: E402
+
+    flow_cfg_path = Path(args.flow_config)
+    if not flow_cfg_path.is_absolute():
+        flow_cfg_path = PROJECT_ROOT / flow_cfg_path
+    with open(flow_cfg_path) as fh:
+        flow_cfg = json.load(fh)
+
+    flow_ckpt = Path(args.flow_checkpoint)
+    if not flow_ckpt.is_absolute():
+        flow_ckpt = PROJECT_ROOT / flow_ckpt
+    print(f"[flow] velocity net ← {flow_ckpt}")
+    velocity_net = _load_velocity_net(flow_cfg, str(flow_ckpt), device)
+
+    # Pull z-score stats from the flow cache so the imputer can round-trip
+    # between classifier-native root-centered coordinates and flow space.
+    cache_dir = flow_cfg.get("cache_dir")
+    stats_mean = stats_std = None
+    if cache_dir:
+        cache_path = Path(cache_dir) / "cache.npz"
+        if not cache_path.is_absolute():
+            cache_path = PROJECT_ROOT / cache_path
+        if cache_path.exists():
+            d = np.load(str(cache_path))
+            if "stats_mean" in d.files and "stats_std" in d.files:
+                stats_mean = torch.from_numpy(d["stats_mean"]).to(device).float()
+                stats_std = torch.from_numpy(d["stats_std"]).to(device).float()
+                print(f"[flow] loaded z-score stats from {cache_path}")
+
+    imputer = FlowImputer(
+        velocity_net, device,
+        stats_mean=stats_mean, stats_std=stats_std,
+        num_steps=int(args.flow_num_steps),
+        solver=str(args.flow_solver),
+    )
+    print(f"[flow] FlowImputer(solver={args.flow_solver}, "
+          f"K={args.flow_num_steps})")
+    return imputer
 
 
 def evaluate_sequence(
@@ -240,7 +288,7 @@ def evaluate_sequence(
     imputation: str,
     joint_means: torch.Tensor | None,
     train_pool: torch.Tensor | None,
-    actor_shap: Any | None,
+    flow_imputer: Any | None,
     n_samples: int,
     k_list: tuple[int, ...],
 ) -> dict:
@@ -260,7 +308,7 @@ def evaluate_sequence(
     p_ref = _compute_p_ref(
         classifier_fn, x, class_idx, imputation,
         joint_means=joint_means, train_pool=train_pool,
-        actor_shap=actor_shap, mask=mask, lengths=lengths,
+        flow_imputer=flow_imputer, mask=mask, lengths=lengths,
         n_samples=n_samples, seq_idx=seq_idx,
     )
 
@@ -270,7 +318,7 @@ def evaluate_sequence(
             classifier_fn, x, y, mask, lengths, shap_dict, imputation,
             joint_means=joint_means,
             train_pool=train_pool,
-            actor_shap=actor_shap,
+            flow_imputer=flow_imputer,
             n_samples=n_samples,
             k_list=k_list, p_full=p_full, p_ref=p_ref, seq_idx=seq_idx,
         )
@@ -330,10 +378,11 @@ def main() -> None:
 
     # Imputation
     p.add_argument("--imputation", required=True,
-                   choices=["zero", "mean", "marginal", "actor"],
+                   choices=["zero", "mean", "marginal", "flow_imputer"],
                    help="Shared imputation protocol applied to every ranking.")
     p.add_argument("--n_samples", type=int, default=20,
-                   help="Donor draws (marginal) or completions (actor) per coalition.")
+                   help="Donor draws (marginal) or completions (flow_imputer) "
+                        "per coalition.")
 
     # Backbone / classifier
     p.add_argument("--backbone", required=True)
@@ -342,9 +391,18 @@ def main() -> None:
     p.add_argument("--fold", type=int, required=True)
     p.add_argument("--classifier_ckpt", required=True)
 
-    # Actor (optional)
-    p.add_argument("--actor_ckpt", type=str, default=None)
-    p.add_argument("--actor_config", type=str, default=None)
+    # Flow imputer (optional; required when --imputation flow_imputer)
+    p.add_argument("--flow_config", type=str, default=None,
+                   help="Flow-matching training config (JSON) used to train "
+                        "--flow_checkpoint. Required for --imputation flow_imputer.")
+    p.add_argument("--flow_checkpoint", type=str, default=None,
+                   help="Trained VelocityNet checkpoint (*.ckpt). Required for "
+                        "--imputation flow_imputer.")
+    p.add_argument("--flow_num_steps", type=int, default=100,
+                   help="ODE integration steps for FlowImputer.")
+    p.add_argument("--flow_solver", type=str, default="midpoint",
+                   choices=["euler", "midpoint"],
+                   help="ODE solver for FlowImputer.")
 
     # Bookkeeping
     p.add_argument("--output_dir", required=True)
@@ -379,7 +437,7 @@ def main() -> None:
         print(f"        {len(baseline_rankings)} baseline seq_idx entries "
               f"with methods={sorted(next(iter(baseline_rankings.values())).keys())}")
 
-    # ---------- load classifier, train pool, actor ----------
+    # ---------- load classifier, train pool, flow imputer ----------
     backbone_params = _load_backbone_params(args.backbone, args.config, args.num_folds)
     backbone_name = backbone_params["backbone"]
     motion_encoder = load_motion_encoder(args.classifier_ckpt, backbone_params, device)
@@ -408,9 +466,7 @@ def main() -> None:
             root_centered=args.root_centered,
         )
 
-    actor_shap = _maybe_load_actor_shap(args, device)
-    if actor_shap is not None:
-        actor_shap.eval()
+    flow_imputer = _maybe_load_flow_imputer(args, device)
 
     # ---------- iterate test set ----------
     data_args = _raw_data_args(backbone_params, args.fold, batch_size=1)
@@ -470,7 +526,7 @@ def main() -> None:
             zscore_mean=zscore_mean, zscore_std=zscore_std,
             rankings=rankings, imputation=args.imputation,
             joint_means=joint_means, train_pool=train_pool,
-            actor_shap=actor_shap, n_samples=args.n_samples,
+            flow_imputer=flow_imputer, n_samples=args.n_samples,
             k_list=k_list,
         )
         result["seq_key"] = _strip_view(test_ds.video_names[seq_idx])
@@ -509,7 +565,10 @@ def main() -> None:
         "baseline_jsonl":    args.baseline_jsonl,
         "flow_psi_paths":    list(args.flow_psi_paths),
         "flow_seed_labels":  list(flow_rankings_per_seq.keys()),
-        "actor_ckpt":        args.actor_ckpt,
+        "flow_config":       args.flow_config,
+        "flow_checkpoint":   args.flow_checkpoint,
+        "flow_num_steps":    args.flow_num_steps,
+        "flow_solver":       args.flow_solver,
         "psi_aggregation":   "signed_sum",
         "p_full_warning":    p_full_warning,
         "notes": (

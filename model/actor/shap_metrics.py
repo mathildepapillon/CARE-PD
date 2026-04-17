@@ -657,6 +657,7 @@ def compute_spatial_faithfulness_batched(
     joint_means: torch.Tensor | None = None,
     train_pool: torch.Tensor | None = None,
     actor_shap: Any | None = None,
+    flow_imputer: Any | None = None,
     physics_completer: Any | None = None,
     n_samples: int = 20,
     k_list: tuple[int, ...] = (1, 2, 3, 5),
@@ -810,6 +811,25 @@ def compute_spatial_faithfulness_batched(
         slice_ends: list[int] = []
         for i in range(N):
             comps = actor_shap.sample_completions(
+                x, y, mask, lengths, cms_t[i : i + 1], n_samples=n_samples,
+            )
+            all_completions.extend(comps)
+            slice_ends.append(len(all_completions))
+        all_comp_probs = _batch_classify(
+            classifier_fn, all_completions, class_idx, chunk_size=chunk_size,
+        )
+        starts = [0] + slice_ends[:-1]
+        all_probs = np.array([
+            all_comp_probs[s:e].mean() for s, e in zip(starts, slice_ends)
+        ])
+
+    elif method == "flow_imputer":
+        if flow_imputer is None:
+            raise ValueError("flow_imputer is required for method='flow_imputer'")
+        all_completions: list[torch.Tensor] = []
+        slice_ends: list[int] = []
+        for i in range(N):
+            comps = flow_imputer.sample_completions(
                 x, y, mask, lengths, cms_t[i : i + 1], n_samples=n_samples,
             )
             all_completions.extend(comps)

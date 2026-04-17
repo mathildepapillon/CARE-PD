@@ -220,7 +220,7 @@ def test_trained_checkpoint_median_completeness_below_1pct():
 
     velocity_net = _load_velocity_net(
         flow_cfg,
-        str(PROJECT_ROOT / "experiment_outs/flow_matching/bmclab_h36m3d_fold1_seed123/last.ckpt"),
+        str(PROJECT_ROOT / "experiment_outs/flow_matching/bmclab_h36m3d_fold1/last.ckpt"),
         device,
     )
     classifier_fn, _, _, _ = build_classifier_fn(
