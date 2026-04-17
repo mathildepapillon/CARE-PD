@@ -48,7 +48,7 @@ import json
 import os
 import sys
 from collections import defaultdict
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -69,7 +69,6 @@ from model.actor.shap_metrics import (
     compute_shapley_completeness,
     compute_spatial_faithfulness_batched,
 )
-from model.actor.physics_completer import PhysicsInformedCompleter, load_physics_completer
 from model.motion_encoder import MotionEncoder
 
 # Shared utilities (backbone param loading, data helpers, classifier wrapper,
@@ -104,7 +103,7 @@ def evaluate_sequence(
     zscore_mean: Optional[torch.Tensor],
     zscore_std: Optional[torch.Tensor],
     cfg: dict,
-    physics_completer: Optional[PhysicsInformedCompleter] = None,
+    physics_completer: Optional[Any] = None,
     subject_id: Optional[str] = None,
     physics_cache_record: Optional[dict] = None,
 ) -> dict:
@@ -404,27 +403,7 @@ def main() -> None:
     parser.add_argument('--root_centered', action='store_true', default=False,
                         help='Subtract joint-0 (pelvis) so sequences are root-centred. '
                              'Default: absolute world coordinates (no root-centering).')
-    # Physics-informed baseline (optional — two mutually exclusive modes)
-    parser.add_argument('--physics_stats', default=None,
-                        help='Path to motion_stats_fold*.pkl from compute_motion_stats.py. '
-                             'Loads PhysicsInformedCompleter for physics temporal SHAP and/or '
-                             'live physics spatial SHAP. May be combined with --physics_cache_dir '
-                             '(cache supplies pre-computed spatial physics JSONs).')
-    parser.add_argument('--physics_cache_dir', default=None,
-                        help='Directory of pre-computed JSON files from '
-                             'scripts/precompute_physics_shap.py '
-                             '(spatial SHAP + faithfulness). For temporal physics, also pass '
-                             '--physics_stats.')
-    parser.add_argument('--physics_n_kernel_samples', type=int, default=500,
-                        help='KernelSHAP coalition pairs for the physics method '
-                             '(only used with --physics_stats, not --physics_cache_dir).')
-    parser.add_argument('--physics_n_samples', type=int, default=5,
-                        help='Physics completions averaged per coalition '
-                             '(only used with --physics_stats).')
     args = parser.parse_args()
-
-    # Both may be set: cache supplies pre-computed *spatial* physics; stats file
-    # instantiates PhysicsInformedCompleter for temporal physics (and live spatial).
 
     device = torch.device(args.device)
 
@@ -433,8 +412,6 @@ def main() -> None:
         'n_completion_samples':    args.n_completion_samples,
         'k_list':                  args.k_list,
         'fps':                     args.fps,
-        'physics_n_kernel_samples': args.physics_n_kernel_samples,
-        'physics_n_samples':        args.physics_n_samples,
     }
 
     # ------------------------------------------------------------------
@@ -478,24 +455,9 @@ def main() -> None:
     else:
         zscore_mean = zscore_std = None
 
-    # Physics completer (--physics_stats) and/or spatial cache (--physics_cache_dir).
+    # Physics baseline was retired in the flow-matching cleanup branch.
     physics_completer = None
-    physics_cache: dict[int, dict] = {}   # seq_idx → pre-loaded record
-
-    if args.physics_stats:
-        print(f'  Loading PhysicsInformedCompleter from {args.physics_stats} …')
-        physics_completer = load_physics_completer(args.physics_stats, device)
-        print(f'  physics baseline: n_kernel={args.physics_n_kernel_samples}  '
-              f'n_samples={args.physics_n_samples}')
-    if args.physics_cache_dir:
-        import glob as _glob, json as _json
-        cache_files = sorted(_glob.glob(os.path.join(args.physics_cache_dir, 'seq_*.json')))
-        for cf in cache_files:
-            with open(cf) as fh:
-                rec = _json.load(fh)
-            physics_cache[rec['seq_idx']] = rec
-        print(f'  Loaded {len(physics_cache)} pre-computed physics records '
-              f'from {args.physics_cache_dir}')
+    physics_cache: dict[int, dict] = {}
 
     # ------------------------------------------------------------------
     # Load test data (same raw pipeline).
@@ -584,11 +546,6 @@ def main() -> None:
         'classifier_ckpt':          args.classifier_ckpt,
         'output_dir':               output_dir,
         'p_full_warning':           p_full_warning,
-        'physics_stats':            args.physics_stats,
-        'physics_cache_dir':        args.physics_cache_dir,
-        'physics_n_kernel_samples': args.physics_n_kernel_samples,
-        'physics_n_samples':        args.physics_n_samples,
-        'physics_sequences_cached': len(physics_cache),
     }
     with open(os.path.join(output_dir, 'aggregate.json'), 'w') as fh:
         json.dump(agg, fh, indent=2)
