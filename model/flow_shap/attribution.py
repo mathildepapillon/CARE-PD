@@ -81,7 +81,7 @@ def compute_flow_shap(
     x_star_flow: Tensor,                 # (B, T, 17, 3) pelvis-centered z-score
     ctx: Dict[str, Any],
     num_steps: int = 100,
-    solver_method: str = "midpoint",
+    solver_method: str = "rk4",
     zero_pelvis: bool = True,
     return_trajectory: bool = False,
 ) -> Dict[str, Any]:
@@ -97,9 +97,11 @@ def compute_flow_shap(
         ctx: side info forwarded to ``classifier_fn`` (at least
             ``{"pelvis_world", "mask"}``; see ``classifier_adapter``).
         num_steps: Number of ODE integration sub-steps ``K``. Paper default 50;
-            we use 100 so trapezoidal completeness error stays <5 %.
+            we use 100 so trapezoidal completeness error stays <1 %.
         solver_method: Any method ``flow_matching.solver.ODESolver`` accepts
             (``"euler"``, ``"midpoint"``, ``"rk4"``, ``"dopri5"``, ...).
+            Default ``"rk4"`` matches OTFlow-SHAP Sec. 5.1's numerical-precision
+            target (median relative completeness residual <1 % at K=100).
         zero_pelvis: If ``True`` (default) force ``psi[..., 0, :] = 0`` after
             integration. The pre-zero values are returned under ``"pelvis_leak_abs"``
             for diagnostics.
@@ -140,13 +142,17 @@ def compute_flow_shap(
 
     # ------------------------------------------------------------------
     # 1. Backward ODE solve (no grad) — t: 1 → 0.
+    # ``ODESolver.sample`` has a required positional ``step_size`` arg. We
+    # set it to ``None`` so ``torchdiffeq`` falls back to using the
+    # ``time_grid`` deltas as step sizes — this is the single source of
+    # truth for step spacing and avoids a silent clash with ``time_grid``
+    # if we also specified ``step_size=dt``.
     # ------------------------------------------------------------------
-    step_size = float(dt)
     time_grid_back = torch.linspace(1.0, 0.0, K + 1, device=device, dtype=dtype)
     with torch.no_grad():
         back_out = odesolver.sample(
             x_init=x_star_flow.detach(),
-            step_size=step_size,
+            step_size=None,
             method=solver_method,
             time_grid=time_grid_back,
             return_intermediates=True,

@@ -1,6 +1,6 @@
 {
-  "flow_config":           "configs/flow_matching/bmclab_h36m3d_fold1.json",
-  "flow_checkpoint":       "experiment_outs/flow_matching/bmclab_h36m3d_fold1/flow_matching_BMCLab_fold1_best.ckpt",
+  "flow_config":           "configs/flow_matching/bmclab_h36m3d_fold1_seed123_xl.json",
+  "flow_checkpoint":       "experiment_outs/flow_matching/bmclab_h36m3d_fold1_seed123_xl/flow_matching_BMCLab_fold1_best.ckpt",
 
   "backbone":              "potr",
   "classifier_checkpoint": "experiment_outs/Hypertune/POTR_BMCLab/0/models/train_BMCLab_23fold/fold1/latest_epoch.pth.tr",
@@ -20,6 +20,6 @@
   "solver":        "rk4",
   "batch_size":    16,
   "device":        "cuda:0",
-  "output_dir":    "experiment_outs/flow_shap/bmclab_potr_fold1",
+  "output_dir":    "experiment_outs/flow_shap/bmclab_potr_fold1_xl",
   "seed":          42
 }

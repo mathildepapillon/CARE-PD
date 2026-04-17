@@ -17,6 +17,7 @@ from .diagnostics import (
     flow_consistency_error,
     pelvis_leak,
 )
+from .imputer import FlowImputer
 
 __all__ = [
     "compute_flow_shap",
@@ -24,4 +25,5 @@ __all__ = [
     "completeness_residual",
     "flow_consistency_error",
     "pelvis_leak",
+    "FlowImputer",
 ]

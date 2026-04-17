@@ -182,13 +182,28 @@ def main() -> None:
     p.add_argument("--fce_batches", type=int, default=2,
                    help="Number of batches to run trajectory-returning compute_flow_shap "
                         "on for FCE stats. Trajectory tensors are expensive in memory.")
+    p.add_argument("--num_ode_steps", type=int, default=None,
+                   help="Override config num_ode_steps (handy for K-robustness sweeps).")
+    p.add_argument("--output_dir", default=None,
+                   help="Override config output_dir (handy for K-robustness sweeps).")
+    p.add_argument("--flow_checkpoint", default=None,
+                   help="Override config flow_checkpoint (handy for multi-seed sweeps).")
+    p.add_argument("--flow_config", default=None,
+                   help="Override config flow_config (handy for multi-seed sweeps).")
+    p.add_argument("--cache_dir", default=None,
+                   help="Override flow cache_dir (e.g. to run flow-SHAP on the "
+                        "classifier's held-out eval subjects instead of the "
+                        "flow's own val split).")
     args = p.parse_args()
 
     cfg_path = Path(args.config).resolve()
     with open(cfg_path) as f:
         cfg = json.load(f)
 
-    flow_cfg_path = PROJECT_ROOT / cfg["flow_config"]
+    flow_cfg_rel = args.flow_config if args.flow_config is not None else cfg["flow_config"]
+    flow_cfg_path = Path(flow_cfg_rel)
+    if not flow_cfg_path.is_absolute():
+        flow_cfg_path = PROJECT_ROOT / flow_cfg_path
     with open(flow_cfg_path) as f:
         flow_cfg = json.load(f)
 
@@ -200,7 +215,11 @@ def main() -> None:
     np.random.seed(seed)
 
     # --- flow cache + pelvis world ---
-    cache_path = PROJECT_ROOT / flow_cfg["cache_dir"] / "cache.npz"
+    cache_dir_raw = args.cache_dir if args.cache_dir is not None else flow_cfg["cache_dir"]
+    cache_dir_path = Path(cache_dir_raw)
+    if not cache_dir_path.is_absolute():
+        cache_dir_path = PROJECT_ROOT / cache_dir_path
+    cache_path = cache_dir_path / "cache.npz"
     print(f"[flow_shap] loading flow cache: {cache_path}", flush=True)
     cache = load_flow_cache(cache_path, split=cfg.get("data", {}).get("split", "val"))
 
@@ -232,7 +251,10 @@ def main() -> None:
     assert pelvis_world.shape == (N, seq_len, 3)
 
     # --- velocity net ---
-    flow_ckpt = PROJECT_ROOT / cfg["flow_checkpoint"]
+    flow_ckpt_rel = args.flow_checkpoint if args.flow_checkpoint is not None else cfg["flow_checkpoint"]
+    flow_ckpt = Path(flow_ckpt_rel)
+    if not flow_ckpt.is_absolute():
+        flow_ckpt = PROJECT_ROOT / flow_ckpt
     print(f"[flow_shap] loading velocity net: {flow_ckpt}", flush=True)
     velocity_net = _load_velocity_net(flow_cfg, str(flow_ckpt), device)
 
@@ -261,7 +283,10 @@ def main() -> None:
         indices = indices[:int(max_clips)]
         print(f"[flow_shap] limiting to first {len(indices)} clips (max_clips)", flush=True)
 
-    out_dir = PROJECT_ROOT / cfg["output_dir"]
+    out_dir_raw = args.output_dir if args.output_dir is not None else cfg["output_dir"]
+    out_dir = Path(out_dir_raw)
+    if not out_dir.is_absolute():
+        out_dir = PROJECT_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     psi_path = out_dir / "psi.npz"
     summary_path = out_dir / "summary.json"
@@ -278,8 +303,9 @@ def main() -> None:
     class_idx_all: list = []
     used_indices: list = []
 
-    num_ode_steps = int(cfg.get("num_ode_steps", 100))
-    solver_method = str(cfg.get("solver", "midpoint"))
+    num_ode_steps = int(args.num_ode_steps if args.num_ode_steps is not None
+                        else cfg.get("num_ode_steps", 100))
+    solver_method = str(cfg.get("solver", "rk4"))
     class_policy_raw = cfg.get("class_policy", "predicted")
     class_policy: Any = class_policy_raw
     if isinstance(class_policy_raw, str) and class_policy_raw.isdigit():

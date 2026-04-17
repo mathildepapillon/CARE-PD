@@ -17,7 +17,7 @@
   },
 
   "num_ode_steps": 100,
-  "solver":        "midpoint",
+  "solver":        "rk4",
   "batch_size":    16,
   "device":        "cuda:0",
   "output_dir":    "experiment_outs/flow_shap/bmclab_pfv2_fold1",
