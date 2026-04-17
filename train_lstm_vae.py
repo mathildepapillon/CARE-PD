@@ -280,6 +280,8 @@ class LstmVAELit(L.LightningModule):
         gamma: float = 1.0,
         mask_warmup_epochs: int = 20,
         mask_axis: str = "both",
+        # Per-joint loss weighting (for addressing foot smearing, etc.)
+        joint_weights: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -295,6 +297,29 @@ class LstmVAELit(L.LightningModule):
             dropout=dropout,
             n_mix=n_mix,
         )
+
+        # Register (J, 3) per-joint weights as a buffer so they move with the
+        # module and are saved inside the checkpoint. Defaults to all-ones
+        # (i.e. behaviour identical to the unweighted losses).
+        n_joints = input_dim // 3
+        if joint_weights is None:
+            w = torch.ones(n_joints)
+        else:
+            if len(joint_weights) != n_joints:
+                raise ValueError(
+                    f"joint_weights has {len(joint_weights)} entries but "
+                    f"input_dim implies {n_joints} joints."
+                )
+            w = torch.tensor(joint_weights, dtype=torch.float32)
+        # Normalise so that mean weight = 1; this keeps the recon_loss scale
+        # comparable across runs even when we up-weight a few joints, so
+        # {vel_w, std_w, beta} don't need re-tuning.
+        w = w * (n_joints / w.sum())
+        # ``persistent=False`` so the buffer is NOT written into the saved
+        # state_dict. The vector is fully determined by the ``joint_weights``
+        # hparam and regenerated in ``__init__`` every time — this lets us
+        # resume old checkpoints that were saved before this field existed.
+        self.register_buffer("joint_weight_vec", w, persistent=False)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -344,14 +369,41 @@ class LstmVAELit(L.LightningModule):
             return per_joint_err[obs].mean()
         return per_joint_err.mean()
 
-    @staticmethod
-    def _velocity_loss(recon: Tensor, target: Tensor) -> Tensor:
-        return F.mse_loss(recon[:, 1:] - recon[:, :-1],
-                          target[:, 1:] - target[:, :-1])
+    def _weighted_reduce(self, per_elt: Tensor) -> Tensor:
+        """Reduce a ``(B, T, J, 3)`` (or ``(B, J, 3)``) per-element loss map
+        using the registered per-joint weight vector.
 
-    @staticmethod
-    def _temporal_std_loss(recon: Tensor, target: Tensor) -> Tensor:
-        return F.mse_loss(recon.std(dim=1), target.std(dim=1))
+        We multiply by ``joint_weight_vec[J]`` and take the mean, which is
+        equivalent to a weighted average because the vector is normalised to
+        mean=1 in ``__init__``.
+        """
+        w = self.joint_weight_vec  # (J,)
+        # Broadcast over leading and trailing dims.
+        shape = [1] * per_elt.ndim
+        shape[-2] = w.shape[0]
+        return (per_elt * w.view(*shape)).mean()
+
+    def _recon_loss(self, recon: Tensor, target: Tensor) -> Tensor:
+        B, T, D = target.shape
+        J = D // 3
+        r = recon.view(B, T, J, 3)
+        g = target.view(B, T, J, 3)
+        return self._weighted_reduce((r - g).abs())
+
+    def _velocity_loss(self, recon: Tensor, target: Tensor) -> Tensor:
+        B, T, D = target.shape
+        J = D // 3
+        dr = (recon[:, 1:] - recon[:, :-1]).view(B, T - 1, J, 3)
+        dt = (target[:, 1:] - target[:, :-1]).view(B, T - 1, J, 3)
+        return self._weighted_reduce((dr - dt).pow(2))
+
+    def _temporal_std_loss(self, recon: Tensor, target: Tensor) -> Tensor:
+        B, T, D = target.shape
+        J = D // 3
+        # std over time per feature → (B, J, 3)
+        sr = recon.view(B, T, J, 3).std(dim=1)
+        sg = target.view(B, T, J, 3).std(dim=1)
+        return self._weighted_reduce((sr - sg).pow(2))
 
     def _sample_coalition_mask(self, x: Tensor) -> Tensor | None:
         """Sample a coalition mask for the masked encoder."""
@@ -375,7 +427,7 @@ class LstmVAELit(L.LightningModule):
         x = batch  # (B, T, 51)
         recon, mu, log_var = self.model(x)
 
-        recon_loss = F.l1_loss(recon, x)
+        recon_loss = self._recon_loss(recon, x)
         vel_loss   = self._velocity_loss(recon, x)
         std_loss   = self._temporal_std_loss(recon, x)
         kl_loss    = self._kl_free_bits(mu, log_var, self.hparams.free_nats)
@@ -403,6 +455,18 @@ class LstmVAELit(L.LightningModule):
             mpjpe_masked_obs = self._mpjpe_observed(recon_masked, x, coalition_mask)
 
         mpjpe = self._mpjpe(recon, x)
+
+        # Per-joint MPJPE for the joints that are up-weighted, so we can see
+        # whether the foot reconstruction actually improves over the run.
+        B, T, D = x.shape
+        J = D // 3
+        per_joint_mpjpe = (
+            recon.view(B, T, J, 3) - x.view(B, T, J, 3)
+        ).norm(dim=-1).mean(dim=(0, 1))                # (J,)
+        for j, w in enumerate(self.joint_weight_vec.tolist()):
+            if abs(w - 1.0) > 1e-6:
+                self.log(f"{stage}/mpjpe_j{j}", per_joint_mpjpe[j],
+                         on_epoch=True, on_step=False)
 
         self.log(f"{stage}/beta",  beta,       on_epoch=True, on_step=False)
         self.log(f"{stage}/recon", recon_loss, prog_bar=(stage == "train"), on_epoch=True, on_step=False)
@@ -490,6 +554,19 @@ def parse_args() -> argparse.Namespace:
                    choices=["spatial", "temporal", "both"],
                    help="Coalition mask axis (spatial=joints, temporal=frames, both=random).")
 
+    # Per-joint loss weighting (helpful for addressing foot smearing).
+    p.add_argument("--foot_weight", type=float, default=1.0,
+                   help="Multiplier applied to the foot joints' reconstruction, "
+                        "velocity, and temporal-std losses. 1.0 = no change.")
+    p.add_argument("--foot_joints", type=str, default="3,6",
+                   help="Comma-separated joint indices to treat as feet (default "
+                        "3,6 = right foot + left foot for H36M 17-joint skeleton).")
+
+    # Resume / fine-tune
+    p.add_argument("--resume_from", type=str, default=None,
+                   help="Path to a .ckpt to resume from (Lightning ckpt_path). "
+                        "Restores model weights + optimizer + epoch counter.")
+
     p.add_argument("--max_epochs", type=int,   default=150)
     p.add_argument("--devices", nargs="+", default=["4", "5", "6", "7"],
                    help="GPU ids or a single count, space- or comma-separated. "
@@ -534,6 +611,18 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
+    # ---- Per-joint weights ----
+    n_joints = INPUT_DIM // 3
+    joint_weights = [1.0] * n_joints
+    if abs(args.foot_weight - 1.0) > 1e-6:
+        foot_indices = [int(x) for x in args.foot_joints.split(",") if x.strip()]
+        for j in foot_indices:
+            if not 0 <= j < n_joints:
+                raise ValueError(f"foot_joint index {j} out of range [0, {n_joints}).")
+            joint_weights[j] = args.foot_weight
+        print(f"[Loss] Per-joint weights: feet={foot_indices} at "
+              f"×{args.foot_weight}, rest ×1.0 (normalised so mean=1).")
+
     # ---- Model ----
     lit = LstmVAELit(
         input_dim=INPUT_DIM,
@@ -554,6 +643,7 @@ def main() -> None:
         gamma=args.gamma,
         mask_warmup_epochs=args.mask_warmup_epochs,
         mask_axis=args.mask_axis,
+        joint_weights=tuple(joint_weights),
     )
 
     # ---- Trainer ----
@@ -600,7 +690,11 @@ def main() -> None:
         log_every_n_steps=10,
     )
 
-    trainer.fit(lit, datamodule=dm)
+    if args.resume_from:
+        print(f"[Resume] Loading state from {args.resume_from}")
+        trainer.fit(lit, datamodule=dm, ckpt_path=args.resume_from)
+    else:
+        trainer.fit(lit, datamodule=dm)
 
 
 if __name__ == "__main__":

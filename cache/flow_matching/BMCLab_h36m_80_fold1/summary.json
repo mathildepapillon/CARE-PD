@@ -1,0 +1,63 @@
+{
+  "dataset": "BMCLab",
+  "data_type": "h36m",
+  "num_folds": 6,
+  "fold": 1,
+  "seq_len": 80,
+  "clip_stride_train": 20,
+  "clip_stride_val": 80,
+  "val_frac": 0.1,
+  "seed": 42,
+  "n_train_clips": 8024,
+  "n_val_clips": 540,
+  "n_train_pids": 17,
+  "n_val_pids": 2,
+  "n_eval_pids": 4,
+  "train_pids": [
+    "SUB02",
+    "SUB03",
+    "SUB04",
+    "SUB05",
+    "SUB06",
+    "SUB07",
+    "SUB08",
+    "SUB13",
+    "SUB14",
+    "SUB16",
+    "SUB17",
+    "SUB19",
+    "SUB20",
+    "SUB22",
+    "SUB23",
+    "SUB24",
+    "SUB26"
+  ],
+  "val_pids": [
+    "SUB15",
+    "SUB21"
+  ],
+  "eval_pids_reserved_for_shap": [
+    "SUB01",
+    "SUB11",
+    "SUB12",
+    "SUB18"
+  ],
+  "stats_mean_shape": [
+    17,
+    3
+  ],
+  "stats_std_shape": [
+    17,
+    3
+  ],
+  "post_zscore_train_nonpelvis_abs_mean_max": 1.2848111271616128e-06,
+  "post_zscore_train_nonpelvis_std_range": [
+    0.10459237428972101,
+    1.0000000444756973
+  ],
+  "std_floor_m": 0.01,
+  "n_saturated_joint_coords": 10,
+  "pelvis_abs_max_before_zscore": 0.0,
+  "cache_path": "/home/papillon/code/CARE-PD/cache/flow_matching/BMCLab_h36m_80_fold1/cache.npz",
+  "sanity_path": "/home/papillon/code/CARE-PD/cache/flow_matching/BMCLab_h36m_80_fold1/sanity.npz"
+}

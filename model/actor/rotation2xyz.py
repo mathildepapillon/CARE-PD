@@ -16,6 +16,23 @@ Key design choices (from ACTOR, not invented here):
 """
 
 import contextlib
+import inspect as _inspect
+
+import numpy as _np
+
+# chumpy (pickled inside SMPL_NEUTRAL.pkl) was last updated for Python 3.6 and
+# NumPy 1.19; it calls ``inspect.getargspec`` and imports ``numpy.bool``,
+# ``numpy.float``, etc., none of which exist in modern stacks. These shims
+# make chumpy importable under Python 3.11 + NumPy ≥ 1.24 so SMPLLayer can
+# unpickle the body model. Keep them ahead of the ``smplx`` import.
+if not hasattr(_inspect, "getargspec"):
+    _inspect.getargspec = _inspect.getfullargspec
+for _alias, _dtype in (
+    ("bool", bool), ("int", int), ("float", float), ("complex", complex),
+    ("object", object), ("str", str), ("unicode", str),
+):
+    if not hasattr(_np, _alias):
+        setattr(_np, _alias, _dtype)
 
 import torch
 import torch.nn.functional as F

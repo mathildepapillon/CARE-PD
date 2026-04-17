@@ -563,7 +563,11 @@ def _resolve_mode_defaults(args):
     Mutates ``args`` in place.
     """
     if args.data_mode == "6dsmpl":
-        # ACTOR-parity: 24 SMPL joints × 6D rotations
+        # Paper-ACTOR parity: 24 SMPL joints × 6D rotations.
+        # Losses: L = rc + rcxyz + λ_kl · kl  with (1, 1, 1e-5). Nothing else.
+        # All anti-collapse / velocity / free-bits terms are explicitly OFF
+        # so we first verify the plain ACTOR objective reconstructs motion
+        # before stacking on auxiliary losses.
         if args.njoints is None:
             args.njoints = 24
         if args.nfeats is None:
@@ -575,9 +579,9 @@ def _resolve_mode_defaults(args):
         if args.lambda_rr is None:
             args.lambda_rr = 0.0
         if args.lambda_vel is None:
-            args.lambda_vel = 1.0
+            args.lambda_vel = 0.0
         if not hasattr(args, "lambda_velxyz") or args.lambda_velxyz is None:
-            args.lambda_velxyz = 10.0
+            args.lambda_velxyz = 0.0
         if args.lambda_tstd is None:
             args.lambda_tstd = 0.0
         if args.lambda_tstd_hinge is None:
@@ -585,22 +589,22 @@ def _resolve_mode_defaults(args):
         if args.lambda_kl_fb is None:
             args.lambda_kl_fb = 0.0
     elif args.data_mode == "h36m_rot6d":
-        # H36M 6D rotations: 32 joints × 6D
+        # H36M 6D rotations: 32 joints × 6D — paper-ACTOR loss recipe.
+        # Losses: rc + rcxyz + λ_kl · kl  (1, 1, 1e-5). No vel / velxyz / tstd.
         if args.njoints is None:
             args.njoints = 32
         if args.nfeats is None:
             args.nfeats = 6
         if args.pose_rep is None:
             args.pose_rep = "rot6d"
-        # Match ACTOR loss recipe: rc + rcxyz + kl (+ vel + velxyz)
         if args.lambda_rcxyz is None:
             args.lambda_rcxyz = 1.0
         if args.lambda_rr is None:
             args.lambda_rr = 0.0
         if args.lambda_vel is None:
-            args.lambda_vel = 1.0
+            args.lambda_vel = 0.0
         if not hasattr(args, "lambda_velxyz") or args.lambda_velxyz is None:
-            args.lambda_velxyz = 10.0
+            args.lambda_velxyz = 0.0
         if args.lambda_tstd is None:
             args.lambda_tstd = 0.0
         if args.lambda_tstd_hinge is None:

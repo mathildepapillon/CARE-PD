@@ -120,12 +120,18 @@ def _masked_temporal_std(
     mask_f: torch.Tensor,
     lengths: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute per-(B, J, F) temporal std, excluding padded frames."""
+    """Compute per-(B, J, F) temporal std, excluding padded frames.
+
+    Note: ``var`` is clamped to ``1e-8`` before sqrt. When the reconstruction
+    collapses to a perfectly static sequence (var == 0), plain ``sqrt`` has a
+    singular derivative and produces NaN gradients — exactly when the hinge
+    loss most needs a clean push away from collapse.
+    """
     t = tensor * mask_f
     mean = t.sum(dim=-1) / lengths.unsqueeze(-1)          # (B, J, F)
     diff2 = ((t - mean.unsqueeze(-1)) * mask_f).pow(2)
     var = diff2.sum(dim=-1) / (lengths.unsqueeze(-1) - 1)
-    return var.sqrt()
+    return var.clamp_min(1e-8).sqrt()
 
 
 def compute_tstd_loss(_model, batch: dict) -> torch.Tensor:
