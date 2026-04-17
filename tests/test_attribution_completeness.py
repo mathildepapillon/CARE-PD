@@ -174,13 +174,13 @@ def test_rk4_beats_euler_on_curved_integrand():
 def _skip_reason() -> str | None:
     if not torch.cuda.is_available():
         return "CUDA not available"
-    flow_cfg = PROJECT_ROOT / "configs/flow_matching/bmclab_h36m3d_fold1_seed123.json"
+    flow_cfg = PROJECT_ROOT / "configs/flow_matching/bmclab_h36m3d_fold1.json"
     if not flow_cfg.exists():
-        return "flow_matching seed123 config missing"
+        return "flow_matching BMCLab fold1 config missing"
     cache = PROJECT_ROOT / json.loads(flow_cfg.read_text())["cache_dir"] / "cache.npz"
     if not cache.exists():
         return f"flow cache missing at {cache}"
-    flow_ckpt_dir = PROJECT_ROOT / "experiment_outs/flow_matching/bmclab_h36m3d_fold1_seed123"
+    flow_ckpt_dir = PROJECT_ROOT / "experiment_outs/flow_matching/bmclab_h36m3d_fold1"
     if not (flow_ckpt_dir / "last.ckpt").exists():
         return f"flow checkpoint missing at {flow_ckpt_dir}/last.ckpt"
     potr_ckpt = PROJECT_ROOT / "experiment_outs/Hypertune/POTR_BMCLab/0/models/train_BMCLab_23fold/fold1/latest_epoch.pth.tr"
@@ -200,7 +200,7 @@ def test_trained_checkpoint_median_completeness_below_1pct():
     from scripts.compute_flow_shap import _load_velocity_net
 
     device = torch.device("cuda:0")
-    flow_cfg_path = PROJECT_ROOT / "configs/flow_matching/bmclab_h36m3d_fold1_seed123.json"
+    flow_cfg_path = PROJECT_ROOT / "configs/flow_matching/bmclab_h36m3d_fold1.json"
     flow_cfg = json.loads(flow_cfg_path.read_text())
     cache = load_flow_cache(PROJECT_ROOT / flow_cfg["cache_dir"] / "cache.npz", split="val")
     N = 8

@@ -4,7 +4,7 @@
   "num_folds": 1,
   "fold": 0,
 
-  "cache_dir": "cache/flow_matching/synthetic_gaussian_gpu",
+  "cache_dir": "cache/flow_matching/synthetic_gaussian",
   "seq_len": 81,
   "clip_stride_train": 81,
   "clip_stride_val": 81,
@@ -38,6 +38,6 @@
   "val_sample_n": 4,
 
   "wandb_project": null,
-  "checkpoint_dir": "experiment_outs/flow_matching_synthetic/gaussian_gpu_xl",
+  "checkpoint_dir": "experiment_outs/flow_matching_synthetic/synthetic_gaussian",
   "seed": 42
 }

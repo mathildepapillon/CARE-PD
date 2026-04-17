@@ -16,21 +16,21 @@
   "num_workers": 4,
 
   "d_model": 256,
-  "nhead": 4,
-  "num_layers": 4,
-  "ff_dim": 1024,
+  "nhead": 8,
+  "num_layers": 6,
+  "ff_dim": 1536,
   "dropout": 0.2,
-  "time_emb_dim": 128,
+  "time_emb_dim": 256,
 
   "lr": 2e-4,
   "weight_decay": 0.0,
-  "warmup_steps": 1000,
-  "max_epochs": 300,
+  "warmup_steps": 1500,
+  "max_epochs": 500,
   "grad_clip": 1.0,
   "ema_decay": 0.999,
 
   "precision": "bf16-mixed",
-  "devices": 1,
+  "devices": 4,
   "accelerator": "gpu",
 
   "val_sample_every_n_epochs": 10,
@@ -40,5 +40,5 @@
   "wandb_project": "carepd-flow-matching",
   "wandb_run_name": "bmclab_h36m3d_fold1",
   "checkpoint_dir": "experiment_outs/flow_matching/bmclab_h36m3d_fold1",
-  "seed": 42
+  "seed": 123
 }

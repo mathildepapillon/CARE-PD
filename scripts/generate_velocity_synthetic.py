@@ -1,8 +1,8 @@
 """
 generate_velocity_synthetic.py — cache synthetic benchmark clips for flow-matching training.
 
-Reads the outputs of ``train_actor_shap_synthetic.py`` and produces a
-``cache.npz`` / ``sanity.npz`` pair compatible with ``train_flow_matching.py``.
+Reads the outputs of ``scripts/build_synthetic_gaussian_data.py`` and produces
+a ``cache.npz`` / ``sanity.npz`` pair compatible with ``train_flow_matching.py``.
 
 Unlike ``scripts/generate_velocity.py`` (which pelvis-centres and z-scores
 CARE-PD clips), this script leaves the synthetic data as-is:
@@ -18,7 +18,7 @@ space == data space. ``compute_flow_shap_synthetic.py`` honours this.
 
 Inputs
 ------
-``--ckpt_dir`` (produced by ``train_actor_shap_synthetic.py``):
+``--ckpt_dir`` (produced by ``scripts/build_synthetic_gaussian_data.py``):
 
 * ``x_train_jft.npy``    (N_tr, J, F, T) float32 — training sequences
 * ``synthetic_test.pt``  dict with ``x`` (N_test, T, J, F) — reused as flow-val
@@ -74,8 +74,8 @@ def _load_train_val(
     jft_path = ckpt_dir / "x_train_jft.npy"
     if not jft_path.exists():
         raise FileNotFoundError(
-            f"{jft_path} not found — re-run train_actor_shap_synthetic.py with "
-            f"--checkpoint_dir {ckpt_dir.parent}."
+            f"{jft_path} not found — run scripts/build_synthetic_gaussian_data.py "
+            f"with --out_dir {ckpt_dir} first."
         )
     x_train_jft = np.load(jft_path).astype(np.float32)  # (N, J, F, T)
     if x_train_jft.ndim != 4:
@@ -121,7 +121,7 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--ckpt_dir", required=True,
-                   help="Directory produced by train_actor_shap_synthetic.py "
+                   help="Directory produced by scripts/build_synthetic_gaussian_data.py "
                         "(must contain x_train_jft.npy and synthetic_test.pt).")
     p.add_argument("--out_dir", required=True,
                    help="Output directory for cache.npz / sanity.npz.")

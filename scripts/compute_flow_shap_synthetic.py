@@ -10,15 +10,11 @@ CARE-PD-specific machinery:
 * no z-score denormalization (synthetic caches write ``stats_mean=0``,
   ``stats_std=1``);
 * ``zero_pelvis=False`` — joint 0 carries real signal in synthetic data;
-* classifier is either ``SyntheticMLPClassifier`` (gaussian benchmark) or
-  ``LinearDiagnosticClassifier`` (diagnostic benchmark), both of which take
+* classifier is ``SyntheticMLPClassifier`` (Gaussian benchmark) which takes
   ``(B, J, F, T)`` input.
 
 Output: ``psi.npz`` + ``summary.json`` under ``--output_dir`` (default:
-``<flow_ckpt_dir>/ig_synthetic``). These artifacts are informational only —
-they are **not** consumed by the EC tables in ``evaluate_shap_synthetic.py``
-(which use the RePaint-style imputer bridge instead, see ``FlowSyntheticWrapper``
-there).
+``<flow_ckpt_dir>/ig_synthetic``).
 
 Usage
 -----
@@ -126,25 +122,6 @@ def _load_gaussian_classifier(ckpt_dir: Path, device: torch.device) -> nn.Module
     return clf
 
 
-def _load_diagnostic_classifier(ckpt_dir: Path, device: torch.device) -> nn.Module:
-    from synthetic.diagnostic_motion import LinearDiagnosticClassifier
-
-    w_true = np.load(ckpt_dir / "w_true.npy")
-    clf = LinearDiagnosticClassifier(w_true)
-    clf.load_state_dict(
-        torch.load(str(ckpt_dir / "synthetic_clf.pt"), map_location="cpu",
-                   weights_only=False),
-        strict=False,
-    )
-    mu_j_path = ckpt_dir / "mu_j.npy"
-    if mu_j_path.exists():
-        clf.register_buffer("mu_j", torch.tensor(np.load(mu_j_path)))
-    clf.to(device).eval()
-    for p in clf.parameters():
-        p.requires_grad_(False)
-    return clf
-
-
 # ---------------------------------------------------------------------------
 # Classifier adapters: bridge (B, T, J, C) flow-space ↔ classifier input
 # ---------------------------------------------------------------------------
@@ -157,9 +134,7 @@ def _make_classifier_fn(
     """Return a callable ``classifier_fn(x_flow, ctx) -> (B,)``.
 
     The flow input is ``(B, T, 17, 3)``; the synthetic classifiers expect
-    ``(B, J, F, T)``. We permute and gather ``ctx["class_idx"]`` for the
-    Gaussian multi-class case; for the diagnostic (scalar regressor) we
-    return the scalar output directly.
+    ``(B, J, F, T)``. We permute and gather ``ctx["class_idx"]``.
     """
     if data_mode == "synthetic_gaussian":
         def classifier_fn(x_flow: torch.Tensor, ctx: Dict[str, Any]) -> torch.Tensor:
@@ -170,12 +145,6 @@ def _make_classifier_fn(
             if cls.ndim == 0:
                 cls = cls.expand(x_flow.shape[0])
             return probs.gather(1, cls.view(-1, 1)).squeeze(-1)
-        return classifier_fn
-
-    if data_mode == "synthetic_diagnostic":
-        def classifier_fn(x_flow: torch.Tensor, ctx: Dict[str, Any]) -> torch.Tensor:
-            x_bjft = x_flow.permute(0, 2, 3, 1).contiguous()
-            return clf(x_bjft)  # (B,) scalar regression
         return classifier_fn
 
     raise ValueError(f"Unknown data_mode: {data_mode!r}")
@@ -205,16 +174,16 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt_dir", required=True,
-                   help="Directory produced by train_actor_shap_synthetic.py.")
+                   help="Directory produced by scripts/build_synthetic_gaussian_data.py.")
     p.add_argument("--flow_ckpt_dir", required=True,
                    help="Directory produced by train_flow_matching.py "
                         "(must contain last.ckpt or flow_matching_*_best.ckpt).")
     p.add_argument("--flow_config", required=True,
                    help="Path to the flow-matching JSON config used to train "
                         "the checkpoint in --flow_ckpt_dir.")
-    p.add_argument("--data_mode", choices=("synthetic_gaussian", "synthetic_diagnostic"),
-                   default=None,
-                   help="If not set, read from <ckpt_dir>/config.json.")
+    p.add_argument("--data_mode", choices=("synthetic_gaussian",),
+                   default="synthetic_gaussian",
+                   help="Synthetic benchmark. Only 'synthetic_gaussian' is supported.")
     p.add_argument("--n_clips", type=int, default=100,
                    help="Cap on test clips to attribute (0 = all).")
     p.add_argument("--batch_size", type=int, default=16)
@@ -258,13 +227,9 @@ def main() -> None:
     velocity_net = _load_velocity_net(flow_cfg, ckpt_path, device)
 
     print(f"[ig_synth] classifier   ← {ckpt_dir} (mode={data_mode})")
-    if data_mode == "synthetic_gaussian":
-        clf = _load_gaussian_classifier(ckpt_dir, device)
-        num_classes = int(getattr(clf, "net", nn.Identity())[-1].out_features) \
-                      if hasattr(clf, "net") else 3
-    else:
-        clf = _load_diagnostic_classifier(ckpt_dir, device)
-        num_classes = 1
+    clf = _load_gaussian_classifier(ckpt_dir, device)
+    num_classes = int(getattr(clf, "net", nn.Identity())[-1].out_features) \
+                  if hasattr(clf, "net") else 3
     classifier_fn = _make_classifier_fn(clf, data_mode, num_classes)
 
     # --- load test clips ----------------------------------------------------
