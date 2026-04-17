@@ -51,19 +51,59 @@ _BASELINE_DIRS = {
     2: "shap_baselines_potr_bmclab_fold2",
     8: "shap_baselines_potr_bmclab_fold8",
 }
+
+# Current-code baseline reruns on SUB01 (the classifier's held-out LOSO fold-1
+# test set). Used by Table 5 to enforce apples-to-apples comparability with
+# the flow-SHAP pipeline: same classifier_fn, same preprocessing, same 240
+# sequences, same seq_idx space as the flow-SHAP per_sequence.jsonl below.
+_BASELINE_CURRENT_DIRS = {
+    1: "shap_baselines_potr_bmclab_fold1_current",
+}
 _CROSSEVAL_DIRS = {
     1: "shap_crosseval_potr_bmclab_fold1",
     2: "shap_crosseval_potr_bmclab_fold2",
     8: "shap_crosseval_potr_bmclab_fold8",
 }
 
+# OTFlow-SHAP aggregate JSONs (one per flow seed).  Populated from
+# ``scripts/compute_flow_shap_faithfulness.py`` runs with
+# ``--readout prob --include_pelvis --k_list 1,2,3,5``. The .jsonl per-clip
+# files live next to each .json and have the same stem.
+_FLOW_SHAP_AGG_DIRS = {
+    1: [
+        "experiment_outs/flow_shap/bmclab_potr_fold1_seeds/seed42/faithfulness_noise_x0_prob_J17.json",
+        "experiment_outs/flow_shap/bmclab_potr_fold1_seeds/seed123/faithfulness_noise_x0_prob_J17.json",
+        "experiment_outs/flow_shap/bmclab_potr_fold1_seeds/seed456/faithfulness_noise_x0_prob_J17.json",
+    ],
+}
+
+# Sequence-level OTFlow-SHAP faithfulness runs produced by
+# ``scripts/compute_flow_shap_faithfulness_seq_level.py`` on the *classifier's*
+# LOSO-held-out test fold (SUB01 for BMCLab 23-fold fold 1). Each aggregate
+# JSON corresponds to one flow seed; its sibling per_sequence.jsonl carries
+# 240 per-sequence records keyed by the same ``seq_idx`` space as the baseline
+# runs in ``_BASELINE_CURRENT_DIRS`` — enabling a paired comparison.
+_FLOW_SHAP_SEQ_DIRS = {
+    1: [
+        "experiment_outs/flow_shap/bmclab_potr_fold1_classifier_eval/seed42/faithfulness_seq_level_signed/aggregate.json",
+        "experiment_outs/flow_shap/bmclab_potr_fold1_classifier_eval/seed123/faithfulness_seq_level_signed/aggregate.json",
+        "experiment_outs/flow_shap/bmclab_potr_fold1_classifier_eval/seed456/faithfulness_seq_level_signed/aggregate.json",
+    ],
+}
+
 METHODS = ["actor", "zero", "mean", "marginal"]
 METHOD_LABELS = {
-    "actor":    "ActorSHAP (ours)",
-    "zero":     "Zero",
-    "mean":     "Mean",
-    "marginal": "Marginal",
+    "actor":     "ActorSHAP (ours)",
+    "zero":      "Zero",
+    "mean":      "Mean",
+    "marginal":  "Marginal",
+    "flow_shap": "OTFlow-SHAP (ours)",
 }
+
+# Method set for the apples-to-apples OTFlow-SHAP comparison (Table 5).
+# ``actor`` is included only when ActorSHAP results are available; the
+# display order below is the order used in the table columns.
+METHODS_FLOW_CMP_BASE = ["zero", "mean", "marginal", "actor", "flow_shap"]
 
 # ---------------------------------------------------------------------------
 # Loaders
@@ -102,6 +142,101 @@ def _load_baseline_seqs(fold: int) -> list[dict]:
         if r["seq_idx"] not in seqs:
             seqs[r["seq_idx"]] = r
     return list(seqs.values())
+
+
+def _load_flow_shap_per_clip(fold: int) -> list[dict]:
+    """Load OTFlow-SHAP per-clip records from every available seed for ``fold``.
+
+    Each returned record is the JSON emitted alongside
+    ``faithfulness_*_prob_J17.json`` and has the same ``faithfulness``-key
+    layout as ``evaluate_shap_baselines.py``. We augment each record with a
+    ``seed`` field carrying the seed integer (parsed from the directory name
+    ``seed<N>``) so downstream analysis can see seed-to-seed variability.
+    """
+    here  = os.path.dirname(os.path.abspath(__file__))
+    paths = _FLOW_SHAP_AGG_DIRS.get(fold, [])
+    out: list[dict] = []
+    for rel in paths:
+        json_path  = os.path.normpath(os.path.join(here, rel))
+        jsonl_path = json_path[:-5] + ".jsonl"
+        if not os.path.exists(jsonl_path):
+            continue
+        # Parse seed from parent directory name (e.g. '.../seed42/...').
+        parent = os.path.basename(os.path.dirname(json_path))
+        try:
+            seed = int(parent.replace("seed", ""))
+        except Exception:
+            seed = -1
+        for r in _load_jsonl(jsonl_path):
+            r["seed"] = seed
+            out.append(r)
+    return out
+
+
+def _load_flow_shap_aggregate(fold: int) -> list[dict]:
+    """Load the per-seed ``aggregate`` dicts written by
+    ``compute_flow_shap_faithfulness.py``. Returns one dict per seed."""
+    here  = os.path.dirname(os.path.abspath(__file__))
+    paths = _FLOW_SHAP_AGG_DIRS.get(fold, [])
+    out: list[dict] = []
+    for rel in paths:
+        json_path = os.path.normpath(os.path.join(here, rel))
+        if os.path.exists(json_path):
+            with open(json_path) as f:
+                out.append(json.load(f))
+    return out
+
+
+def _load_baseline_current_seqs(fold: int) -> list[dict]:
+    """Load the current-code baseline rerun on the classifier's SUB01 fold.
+
+    This is the version used by Table 5 so that every method's classifier_fn
+    invocations were produced with the *same* preprocessing pipeline as the
+    flow-SHAP runs. The pre-existing ``_BASELINE_DIRS`` entries are kept for
+    historical tables (Tables 1-4) but are stale relative to the current
+    ``build_classifier_fn`` and cannot be used for direct head-to-head with
+    flow-SHAP.
+    """
+    rel = _BASELINE_CURRENT_DIRS.get(fold)
+    if rel is None:
+        return []
+    p = os.path.join(RESULTS_ROOT, rel, "per_sequence.jsonl")
+    if not os.path.exists(p):
+        return []
+    seqs: dict[int, dict] = {}
+    for r in _load_jsonl(p):
+        if r["seq_idx"] not in seqs:
+            seqs[r["seq_idx"]] = r
+    return list(seqs.values())
+
+
+def _load_flow_shap_per_sequence(fold: int) -> list[dict]:
+    """Load sequence-level OTFlow-SHAP faithfulness records from every seed
+    for ``fold``. Records are keyed by ``seq_idx`` in the same 240-sequence
+    test space as ``_load_baseline_current_seqs``.
+
+    Each returned record is augmented with a ``seed`` field (parsed from the
+    parent directory name ``seed<N>``) so per-sample means can be pooled
+    across seeds while keeping cross-seed variability visible. Missing files
+    are skipped silently.
+    """
+    here  = os.path.dirname(os.path.abspath(__file__))
+    paths = _FLOW_SHAP_SEQ_DIRS.get(fold, [])
+    out: list[dict] = []
+    for rel in paths:
+        agg_path = os.path.normpath(os.path.join(here, rel))
+        jsonl_path = os.path.join(os.path.dirname(agg_path), "per_sequence.jsonl")
+        if not os.path.exists(jsonl_path):
+            continue
+        seed_dir = os.path.basename(os.path.dirname(os.path.dirname(agg_path)))
+        try:
+            seed = int(seed_dir.replace("seed", ""))
+        except Exception:
+            seed = -1
+        for r in _load_jsonl(jsonl_path):
+            r["seed"] = seed
+            out.append(r)
+    return out
 
 
 def _load_crosseval_seqs(fold: int, min_p_full: Optional[float] = None) -> list[dict]:
@@ -526,6 +661,389 @@ def make_table4(folds: list[int], min_p_full: Optional[float], fmt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Table 5: OTFlow-SHAP apples-to-apples comparison vs zero / mean / marginal
+# ---------------------------------------------------------------------------
+
+def make_table5_flow_shap(folds: list[int], fmt: str,
+                          include_actor: bool = False) -> str:
+    """Fair head-to-head spatial faithfulness on the classifier's held-out
+    test fold, comparing every SHAP ranking under a **shared** zero-imputation
+    protocol.
+
+    *Pipeline parity* (the whole point of this table):
+
+      - **Same test set**: 240 SUB01 sequences from the POTR 23-fold LOSO
+        held-out split (SUB01 is rigorously out-of-sample for the classifier).
+        Each ``seq_idx ∈ [0, 240)`` names the *same* underlying sequence
+        across every method.
+      - **Same classifier_fn**: all runs are produced with the current
+        ``model.actor.shap_eval_shared.build_classifier_fn`` (pelvis-restored,
+        raw-space readout, softmax prob at target class).
+      - **Same imputation (zero)**: every ranking is evaluated by masking
+        selected joints to 0 in the raw pose space via
+        ``compute_spatial_faithfulness_batched(method='zero', ...)``.
+        This isolates *ranking quality* from imputation severity
+        (cross-evaluation convention of ShapGCN / OTFlowSHAP).
+      - **Same ranking universe**: all 17 H36M joints (pelvis included).
+      - **Same k-grid**: ``k_list = (1, 2, 3, 5)``.
+      - **Same random-control RNG**: seeded by ``seq_idx`` for reproducibility.
+
+    *What differs by method*:
+
+      - ``zero`` / ``mean`` / ``marginal``: KernelSHAP ranking with the
+        matching native baseline (200 coalitions, 20 marginal completions).
+      - ``flow_shap``: OTFlow-SHAP ranking obtained by aggregating per-clip
+        ``|psi|`` from ``psi.npz`` (3 flow seeds × ~369 SUB01 clips) up to
+        one per-joint importance vector per test sequence (mean-over-clips
+        of ``sum_{t,c} |psi[t,j,c]|``). Means/stds are pooled across the 3
+        flow seeds so ``±`` reflects both sequence-to-sequence and
+        seed-to-seed variability.
+
+    With the above held fixed, any remaining difference in PGI / PGU /
+    deletion-AUC / insertion-AUC is attributable to the **ranking** produced
+    by each method. ``actor`` can optionally be included when an ActorSHAP
+    rerun on the same pipeline is available (not yet generated for fold 1).
+    """
+
+    # Loaders keyed by fold. The baselines come from the *current-code* rerun
+    # (``_BASELINE_CURRENT_DIRS``), which shares the classifier_fn and
+    # preprocessing with the flow-SHAP path.
+    fold_cache = {}
+    for fold in folds:
+        bl_seqs = _load_baseline_current_seqs(fold)
+        fs_seqs = _load_flow_shap_per_sequence(fold)
+        fold_cache[fold] = (bl_seqs, fs_seqs)
+
+    # ActorSHAP on the current pipeline is not regenerated yet — gate its
+    # inclusion on caller flag.
+    methods = [m for m in METHODS_FLOW_CMP_BASE
+               if m != "actor" or include_actor]
+    h = ["Metric"] + [METHOD_LABELS[m] for m in methods]
+    rows: list[tuple] = []
+
+    for fold in folds:
+        bl_seqs, fs_seqs = fold_cache[fold]
+        n_fs_seeds = len({r.get("seed", -1) for r in fs_seqs})
+        n_bl = len(bl_seqs)
+        n_fs = len(fs_seqs)
+        if not bl_seqs and not fs_seqs:
+            continue
+
+        # Sanity: the test-set seq_idx domains should match exactly.
+        bl_idx = {s["seq_idx"] for s in bl_seqs}
+        fs_idx = {s["seq_idx"] for s in fs_seqs}
+        common = bl_idx & fs_idx
+        header_note = (
+            f"baselines: n={n_bl} sequences (single pass); "
+            f"flow_shap: {n_fs_seeds} seeds × {n_fs // max(n_fs_seeds, 1)} "
+            f"sequences ({n_fs} per-seed records pooled); "
+            f"intersect(seq_idx)={len(common)}"
+        )
+        rows.append((f"** Fold {fold}  —  {header_note} **",
+                     *["" for _ in methods]))
+
+        def _collect(method: str, path: tuple) -> np.ndarray:
+            if method in ("zero", "mean", "marginal"):
+                return _arr(bl_seqs, "faithfulness", method, *path)
+            if method == "flow_shap":
+                return _arr(fs_seqs, "faithfulness", "flow_shap", *path)
+            return np.array([])
+
+        for k in [1, 3, 5]:
+            pgi = {m: _collect(m, ("pgi_pgu", str(k), "pgi")) for m in methods}
+            pgu = {m: _collect(m, ("pgi_pgu", str(k), "pgu")) for m in methods}
+            rnd = {m: _collect(m, ("pgi_pgu_rand", str(k), "pgi")) for m in methods}
+            diff = {m: (pgi[m] - rnd[m]) if (len(pgi[m]) and len(pgi[m]) == len(rnd[m]))
+                    else np.array([]) for m in methods}
+
+            means = [v.mean() if len(v) else float("nan") for v in pgi.values()]
+            best  = _best(means, higher=True)
+            row   = [f"PGI@{k} ↑"]
+            for m in methods:
+                mn, sd = _ms(pgi[m])
+                row.append(_bold(_fmt(mn, sd), mn, best))
+            rows.append(tuple(row))
+
+            means = [v.mean() if len(v) else float("nan") for v in pgu.values()]
+            best  = _best(means, higher=False)
+            row   = [f"PGU@{k} ↓"]
+            for m in methods:
+                mn, sd = _ms(pgu[m])
+                row.append(_bold(_fmt(mn, sd), mn, best))
+            rows.append(tuple(row))
+
+            means = [v.mean() if len(v) else float("nan") for v in rnd.values()]
+            row   = [f"Rand@{k}"]
+            for m in methods:
+                mn, sd = _ms(rnd[m])
+                row.append(_fmt(mn, sd))
+            rows.append(tuple(row))
+
+            means = [v.mean() if len(v) else float("nan") for v in diff.values()]
+            best  = _best(means, higher=True)
+            row   = [f"PGI−Rand@{k} ↑"]
+            for m in methods:
+                mn, sd = _ms(diff[m])
+                row.append(_bold(_fmt(mn, sd, signed=True), mn, best))
+            rows.append(tuple(row))
+
+            rows.append(tuple(["" for _ in range(len(methods) + 1)]))
+
+        for label, path, higher in [
+            ("Deletion AUC ↓",        ("deletion_auc",),         False),
+            ("Random Deletion AUC",   ("random_deletion_auc",),  False),
+            ("Insertion AUC ↑",       ("insertion_auc",),        True),
+            ("Random Insertion AUC",  ("random_insertion_auc",), True),
+        ]:
+            vals = {m: _collect(m, path) for m in methods}
+            means = [v.mean() if len(v) else float("nan") for v in vals.values()]
+            best  = _best(means, higher)
+            row   = [label]
+            for m in methods:
+                mn, sd = _ms(vals[m])
+                row.append(_bold(_fmt(mn, sd), mn, best))
+            rows.append(tuple(row))
+
+        # Confidence sanity: all methods share p_full, so report it once.
+        pf = _arr(bl_seqs, "p_full")
+        if len(pf):
+            rows.append(tuple(["p_full (sanity)",
+                               _fmt(float(pf.mean()), float(pf.std())),
+                               *["—" for _ in methods[1:]]]))
+
+        rows.append(tuple(["" for _ in range(len(methods) + 1)]))
+
+    title = (
+        "Table 5 — Apples-to-apples spatial faithfulness on the "
+        "classifier-held-out SUB01 fold-1 test set "
+        "(n=240 sequences, softmax prob readout, J=17, k∈{1,2,3,5}, "
+        "n_random_repeats=10, shared zero-imputation protocol). "
+        "OTFlow-SHAP per-joint attributions are the axiomatic Shapley form "
+        "phi_j = Σ_{t,c} psi[t,j,c] (signed sum, summed over clips per "
+        "sequence); the metric ranks by |phi_j|, consistent with how "
+        "KernelSHAP scalars are ranked. The 3 flow seeds contribute 720 "
+        "per-sequence records pooled for means and ±std. The baselines "
+        "(zero/mean/marginal) are KernelSHAP rankings (n_kernel_samples=200) "
+        "produced with the same build_classifier_fn pipeline. Because every "
+        "method uses the same zero imputation at evaluation time, any "
+        "remaining difference isolates **ranking quality**. NB: zero "
+        "imputation is Zero-KernelSHAP's native perturbation (it directly "
+        "decomposes f(x)−f(0)), whereas OTFlow-SHAP's native reference is "
+        "the flow back-solve x0_hat — this protocol therefore gives Zero "
+        "an alignment advantage and is not the same as OTFlow-SHAP's "
+        "synthetic-benchmark setting."
+    )
+    if fmt == "latex":
+        return _latex_table(title, h, rows)
+    return _md_table(title, h, rows)
+
+
+# ---------------------------------------------------------------------------
+# Tables 6 / 7: shared-imputation cross-evaluation
+# (marginal / actor imputation; same 240 test sequences)
+# ---------------------------------------------------------------------------
+
+_SHARED_IMPUTATION_DIRS = {
+    # Each value is a (results-dir, human-readable-imputation-name) tuple, one
+    # per fold. The per_sequence.jsonl at that path is produced by
+    # ``scripts/compute_shared_imputation_faithfulness.py``.
+    "marginal": {
+        1: "shap_shared_imputation_marginal_fold1",
+    },
+    "actor": {
+        1: "shap_shared_imputation_actor_fold1",
+    },
+}
+
+# Display order for ranking-source columns in the shared-imputation tables.
+# ``flow_seed42`` / ``flow_seed123`` / ``flow_seed456`` are collapsed into a
+# single ``flow_shap`` column (pooled across available seeds).
+_SHARED_RANKING_ORDER = ["zero", "mean", "marginal", "flow_shap"]
+_SHARED_RANKING_LABELS = {
+    "zero":      "Zero",
+    "mean":      "Mean",
+    "marginal":  "Marginal",
+    "flow_shap": "OTFlow-SHAP (ours)",
+}
+
+
+def _flatten_shared_rankings(per_seq: list[dict]) -> dict[str, list[dict]]:
+    """Turn a shared-imputation per_sequence.jsonl into per-ranking lists.
+
+    Each input record stores
+    ``faithfulness = {zero: {...}, mean: {...}, marginal: {...},
+                      flow_seed42: {...}, flow_seed123: {...}, ...}``.
+
+    We emit one list per ranking column in ``_SHARED_RANKING_ORDER``. The
+    three flow-seed columns are flattened into a single ``flow_shap`` list
+    so pooled mean/std reflect both sequence and seed variability.
+    """
+    out: dict[str, list[dict]] = {k: [] for k in _SHARED_RANKING_ORDER}
+    for r in per_seq:
+        fmap = r.get("faithfulness", {})
+        for m in ("zero", "mean", "marginal"):
+            if m in fmap:
+                out[m].append({
+                    "seq_idx": r["seq_idx"],
+                    "p_full":  r["p_full"],
+                    "faithfulness": {m: fmap[m]},
+                })
+        for key, val in fmap.items():
+            if key.startswith("flow_") or key.startswith("otflow"):
+                out["flow_shap"].append({
+                    "seq_idx": r["seq_idx"],
+                    "p_full":  r["p_full"],
+                    "seed":    key,
+                    "faithfulness": {"flow_shap": val},
+                })
+    return out
+
+
+def make_table_shared_imputation(
+    folds: list[int], fmt: str, imputation: str,
+) -> str:
+    """Table 6/7 — shared-imputation cross-evaluation of SHAP rankings.
+
+    Same 240 SUB01 sequences, same classifier_fn, same J=17 universe,
+    same k-grid; what changes by row is only the **ranking source**.
+    What changes between this table and Table 5 is the **imputation**
+    protocol — Table 5 uses zero imputation (Zero-KernelSHAP's native
+    counterfactual), while this table uses ``imputation`` (marginal =
+    donor replacement from the training pool; actor = ActorSHAP CVAE
+    completions). Under an imputation that is not any method's native
+    reference, ranking quality is decoupled from the home-turf bias.
+    """
+
+    rel_map = _SHARED_IMPUTATION_DIRS[imputation]
+    h = ["Metric"] + [_SHARED_RANKING_LABELS[m] for m in _SHARED_RANKING_ORDER]
+    rows: list[tuple] = []
+
+    for fold in folds:
+        rel = rel_map.get(fold)
+        if rel is None:
+            continue
+        p = os.path.join(RESULTS_ROOT, rel, "per_sequence.jsonl")
+        if not os.path.exists(p):
+            rows.append((f"** Fold {fold}: {p} not found **",
+                         *["" for _ in _SHARED_RANKING_ORDER]))
+            continue
+
+        per_seq: list[dict] = []
+        for r in _load_jsonl(p):
+            per_seq.append(r)
+        per_ranking = _flatten_shared_rankings(per_seq)
+
+        n_seqs = len(per_seq)
+        flow_seed_set = {r.get("seed") for r in per_ranking["flow_shap"]}
+        n_flow_rankings = len(per_ranking["flow_shap"])
+        n_flow_seeds = len([s for s in flow_seed_set if s])
+        header_note = (
+            f"baselines: n={len(per_ranking['zero'])} sequences; "
+            f"flow_shap: {n_flow_seeds} seed(s) × {n_seqs} sequences "
+            f"({n_flow_rankings} per-seed records pooled). "
+            f"Imputation = {imputation}."
+        )
+        rows.append((f"** Fold {fold}  —  {header_note} **",
+                     *["" for _ in _SHARED_RANKING_ORDER]))
+
+        def _collect(method: str, path: tuple) -> np.ndarray:
+            key = "flow_shap" if method == "flow_shap" else method
+            return _arr(per_ranking[method], "faithfulness", key, *path)
+
+        for k in [1, 3, 5]:
+            pgi = {m: _collect(m, ("pgi_pgu", str(k), "pgi")) for m in _SHARED_RANKING_ORDER}
+            pgu = {m: _collect(m, ("pgi_pgu", str(k), "pgu")) for m in _SHARED_RANKING_ORDER}
+            rnd = {m: _collect(m, ("pgi_pgu_rand", str(k), "pgi")) for m in _SHARED_RANKING_ORDER}
+            diff = {m: (pgi[m] - rnd[m]) if (len(pgi[m]) and len(pgi[m]) == len(rnd[m]))
+                    else np.array([]) for m in _SHARED_RANKING_ORDER}
+
+            means = [v.mean() if len(v) else float("nan") for v in pgi.values()]
+            best  = _best(means, higher=True)
+            row   = [f"PGI@{k} ↑"]
+            for m in _SHARED_RANKING_ORDER:
+                mn, sd = _ms(pgi[m])
+                row.append(_bold(_fmt(mn, sd), mn, best))
+            rows.append(tuple(row))
+
+            means = [v.mean() if len(v) else float("nan") for v in pgu.values()]
+            best  = _best(means, higher=False)
+            row   = [f"PGU@{k} ↓"]
+            for m in _SHARED_RANKING_ORDER:
+                mn, sd = _ms(pgu[m])
+                row.append(_bold(_fmt(mn, sd), mn, best))
+            rows.append(tuple(row))
+
+            row = [f"Rand@{k}"]
+            for m in _SHARED_RANKING_ORDER:
+                mn, sd = _ms(rnd[m])
+                row.append(_fmt(mn, sd))
+            rows.append(tuple(row))
+
+            means = [v.mean() if len(v) else float("nan") for v in diff.values()]
+            best  = _best(means, higher=True)
+            row   = [f"PGI−Rand@{k} ↑"]
+            for m in _SHARED_RANKING_ORDER:
+                mn, sd = _ms(diff[m])
+                row.append(_bold(_fmt(mn, sd, signed=True), mn, best))
+            rows.append(tuple(row))
+
+            rows.append(tuple(["" for _ in range(len(_SHARED_RANKING_ORDER) + 1)]))
+
+        for label, path, higher in [
+            ("Deletion AUC ↓",        ("deletion_auc",),         False),
+            ("Random Deletion AUC",   ("random_deletion_auc",),  False),
+            ("Insertion AUC ↑",       ("insertion_auc",),        True),
+            ("Random Insertion AUC",  ("random_insertion_auc",), True),
+        ]:
+            vals = {m: _collect(m, path) for m in _SHARED_RANKING_ORDER}
+            means = [v.mean() if len(v) else float("nan") for v in vals.values()]
+            best  = _best(means, higher)
+            row   = [label]
+            for m in _SHARED_RANKING_ORDER:
+                mn, sd = _ms(vals[m])
+                row.append(_bold(_fmt(mn, sd), mn, best))
+            rows.append(tuple(row))
+
+        pf = _arr(per_seq, "p_full")
+        if len(pf):
+            rows.append(tuple(["p_full (sanity)",
+                               _fmt(float(pf.mean()), float(pf.std())),
+                               *["—" for _ in _SHARED_RANKING_ORDER[1:]]]))
+
+        rows.append(tuple(["" for _ in range(len(_SHARED_RANKING_ORDER) + 1)]))
+
+    table_num = {"marginal": 6, "actor": 7}[imputation]
+    imp_notes = {
+        "marginal": (
+            "donor joints drawn uniformly from the POTR training pool. "
+            "On-manifold, but not any method's native reference, so "
+            "zero-/mean-/flow-SHAP rankings are all evaluated off-home-turf."
+        ),
+        "actor": (
+            "joints filled with ActorSHAP CVAE completions conditioned on "
+            "observed coalition + class. On-manifold and imputation-aware; "
+            "still not the native reference of zero or flow-SHAP."
+        ),
+    }[imputation]
+    title = (
+        f"Table {table_num} — Cross-evaluation of SHAP rankings under a "
+        f"shared **{imputation} imputation** (SUB01 fold-1 test set, "
+        "n=240 sequences, softmax prob readout, J=17, k∈{1,2,3,5}, "
+        "n_random_repeats=10). Rankings unchanged from Table 5; the only "
+        f"change is the perturbation — {imp_notes} "
+        "Every ranking is measured with the same counterfactual so any "
+        "difference isolates ranking quality on this out-of-home-turf "
+        "imputation. OTFlow-SHAP's per-joint attributions use the axiomatic "
+        "signed-sum form phi_j = Σ_{t,c} psi[t,j,c] (summed over clips per "
+        "sequence). Flow-SHAP seeds are pooled, so its ± reflects both "
+        "sequence and seed variability."
+    )
+    if fmt == "latex":
+        return _latex_table(title, h, rows)
+    return _md_table(title, h, rows)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -702,7 +1220,10 @@ def main() -> None:
                         help="Confidence filter for Table 3 and Table 4.")
     parser.add_argument("--format",     choices=["markdown", "latex"], default="markdown")
     parser.add_argument("--tables",     nargs="+", type=int, default=[1, 2, 3, 4],
-                        help="Which tables to print (0=pooled, 1-4=per-fold).")
+                        help="Which tables to print (0=pooled, 1-4=per-fold, "
+                             "5=OTFlow-SHAP vs baselines @ zero imputation, "
+                             "6=vs baselines @ marginal imputation, "
+                             "7=vs baselines @ actor imputation).")
     parser.add_argument("--output",     default=None,
                         help="Write output to file instead of stdout.")
     args = parser.parse_args()
@@ -720,6 +1241,12 @@ def main() -> None:
         out.append(make_table3(args.folds, args.min_p_full, fmt))
     if 4 in args.tables:
         out.append(make_table4(args.folds, args.min_p_full, fmt))
+    if 5 in args.tables:
+        out.append(make_table5_flow_shap(args.folds, fmt))
+    if 6 in args.tables:
+        out.append(make_table_shared_imputation(args.folds, fmt, "marginal"))
+    if 7 in args.tables:
+        out.append(make_table_shared_imputation(args.folds, fmt, "actor"))
 
     result = "\n\n".join(out)
     if args.output:

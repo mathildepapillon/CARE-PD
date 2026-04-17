@@ -144,6 +144,63 @@ class LstmVaeSyntheticWrapper:
         return [actor[i : i + 1] for i in range(n_samples)]
 
 
+# ---- FlowMatching wrapper --------------------------------------------------
+#
+# ``FlowSyntheticWrapper`` is now a thin alias for the shared
+# ``model.flow_shap.imputer.FlowImputer``.  The synthetic benchmark uses
+# ``stats_mean=None, stats_std=None`` (no z-score) so the behaviour is
+# bit-identical to the original in-file implementation.
+from model.flow_shap.imputer import FlowImputer as FlowSyntheticWrapper
+
+
+def load_flow_velocity_net(flow_ckpt_dir: str, flow_cfg_path: str,
+                           device: torch.device,
+                           num_steps: int = 100,
+                           solver: str = "midpoint") -> FlowSyntheticWrapper:
+    """Load a VelocityNet from ``flow_ckpt_dir/last.ckpt`` (or newest *.ckpt)
+    using architecture hyperparameters from ``flow_cfg_path``."""
+    from model.flow_matching import VelocityNet
+
+    with open(flow_cfg_path) as f:
+        flow_cfg = json.load(f)
+
+    ckpt_dir_p = flow_ckpt_dir
+    last = os.path.join(ckpt_dir_p, "last.ckpt")
+    if os.path.exists(last):
+        ckpt_path = last
+    else:
+        ckpts = [os.path.join(ckpt_dir_p, f) for f in os.listdir(ckpt_dir_p)
+                 if f.endswith(".ckpt")]
+        if not ckpts:
+            raise FileNotFoundError(f"No .ckpt in {ckpt_dir_p}")
+        ckpt_path = max(ckpts, key=os.path.getmtime)
+
+    net = VelocityNet(
+        n_joints=17, n_coords=3,
+        d_model=int(flow_cfg["d_model"]),
+        nhead=int(flow_cfg["nhead"]),
+        num_layers=int(flow_cfg["num_layers"]),
+        ff_dim=int(flow_cfg["ff_dim"]),
+        dropout=float(flow_cfg.get("dropout", 0.0)),
+        time_emb_dim=int(flow_cfg["time_emb_dim"]),
+        max_len=max(int(flow_cfg["seq_len"]) + 16, 256),
+    )
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    raw_state = ckpt.get("state_dict", ckpt)
+    clean_state = {k[len("model."):]: v for k, v in raw_state.items()
+                   if k.startswith("model.")}
+    if not clean_state:
+        raise RuntimeError(
+            f"No 'model.*' keys in {ckpt_path}; sample keys: {list(raw_state.keys())[:5]}"
+        )
+    net.load_state_dict(clean_state, strict=False)
+    net.eval()
+    for p in net.parameters():
+        p.requires_grad_(False)
+    print(f"[Load] FlowMatching VelocityNet ← {ckpt_path} (solver={solver}, K={num_steps})")
+    return FlowSyntheticWrapper(net, device, num_steps=num_steps, solver=solver)
+
+
 def load_lstm_vae(ckpt_dir: str, device: torch.device) -> LstmVaeSyntheticWrapper:
     """Load a trained LstmVAE from lstm_vae_config.json + lstm_vae_model.pt."""
     from model.lstm_vae.model import LstmVAE
@@ -500,6 +557,7 @@ def evaluate_temporal_shap_all_methods(
     rng: np.random.Generator | None = None,
     seed: int | None = None,
     lstm_vae: "LstmVaeSyntheticWrapper | None" = None,
+    flow_matching: "FlowSyntheticWrapper | None" = None,
 ) -> dict[str, dict]:
     """Evaluate all SHAP methods for one test sequence.
 
@@ -686,6 +744,30 @@ def evaluate_temporal_shap_all_methods(
                     v_lstm[i] = float(prob_fn(x_batch).mean().item())
         results["lstm_vae"] = {"v": v_lstm, "phi": _v_to_phi(v_lstm)}
 
+    # ---- FlowMatching method (optional) -------------------------------------
+    if flow_matching is not None:
+        print("flow_matching ...", end=" ", flush=True)
+        v_flow = np.zeros(N_coal)
+        for i, (z, cm) in enumerate(zip(coalitions, all_cms)):
+            s_obs, s_hid = _split(z)
+            if not s_hid:
+                with torch.no_grad():
+                    v_flow[i] = float(prob_fn(x.to(device)).item())
+            elif not s_obs:
+                idxs = rng.integers(0, len(train_pool), size=n_completion_samples)
+                x_marg = train_pool[idxs].to(device)
+                with torch.no_grad():
+                    v_flow[i] = float(prob_fn(x_marg).mean().item())
+            else:
+                comps = flow_matching.sample_completions(
+                    x.to(device), y.to(device), mask.to(device), lengths.to(device),
+                    cm.to(device), n_samples=n_completion_samples,
+                )
+                x_batch = torch.cat(comps, dim=0)
+                with torch.no_grad():
+                    v_flow[i] = float(prob_fn(x_batch).mean().item())
+        results["flow_matching"] = {"v": v_flow, "phi": _v_to_phi(v_flow)}
+
     print("done.")
 
     return results
@@ -849,6 +931,18 @@ def run_gaussian(args: argparse.Namespace) -> None:
     if lstm_vae_ckpt_dir:
         lstm_vae = load_lstm_vae(lstm_vae_ckpt_dir, device)
 
+    # Optionally load FlowMatching velocity net.
+    flow_matching = None
+    flow_ckpt_dir = getattr(args, "flow_ckpt_dir", None)
+    if flow_ckpt_dir:
+        if not getattr(args, "flow_config", None):
+            raise ValueError("--flow_config is required when --flow_ckpt_dir is set.")
+        flow_matching = load_flow_velocity_net(
+            flow_ckpt_dir, args.flow_config, device,
+            num_steps=int(getattr(args, "flow_num_steps", 100)),
+            solver=str(getattr(args, "flow_solver", "midpoint")),
+        )
+
     # Probability function: class 0 probability.
     class_idx = args.class_idx
     def prob_fn(x_in: torch.Tensor) -> torch.Tensor:
@@ -892,6 +986,7 @@ def run_gaussian(args: argparse.Namespace) -> None:
             device=device,
             rng=rng,
             lstm_vae=lstm_vae,
+            flow_matching=flow_matching,
         )
         results_per_seq.append(res)
 
@@ -901,6 +996,8 @@ def run_gaussian(args: argparse.Namespace) -> None:
         methods.append("gaussian_full")
     if lstm_vae is not None:
         methods.append("lstm_vae")
+    if flow_matching is not None:
+        methods.append("flow_matching")
 
     summary = compute_ec_metrics(results_per_seq, methods)
     print_ec_table(summary, rho=bench.rho, alpha=bench.alpha)
@@ -985,6 +1082,18 @@ def run_diagnostic(args: argparse.Namespace) -> None:
     if lstm_vae_ckpt_dir:
         lstm_vae = load_lstm_vae(lstm_vae_ckpt_dir, device)
 
+    # Optionally load FlowMatching velocity net.
+    flow_matching = None
+    flow_ckpt_dir = getattr(args, "flow_ckpt_dir", None)
+    if flow_ckpt_dir:
+        if not getattr(args, "flow_config", None):
+            raise ValueError("--flow_config is required when --flow_ckpt_dir is set.")
+        flow_matching = load_flow_velocity_net(
+            flow_ckpt_dir, args.flow_config, device,
+            num_steps=int(getattr(args, "flow_num_steps", 100)),
+            solver=str(getattr(args, "flow_solver", "midpoint")),
+        )
+
     # Spatial SHAP: M=17 players. Run KernelSHAP for each method.
     M = 17
     rng = np.random.default_rng(args.seed)
@@ -995,6 +1104,8 @@ def run_diagnostic(args: argparse.Namespace) -> None:
     _diag_methods = ["actor", "zero", "mean", "marginal"]
     if lstm_vae is not None:
         _diag_methods.append("lstm_vae")
+    if flow_matching is not None:
+        _diag_methods.append("flow_matching")
     all_phi: dict[str, list] = {m: [] for m in _diag_methods}
     phi_true_list = []
     lengths_t = torch.tensor([T])
@@ -1035,8 +1146,13 @@ def run_diagnostic(args: argparse.Namespace) -> None:
                     x_m = train_pool[idxs].to(device)
                     with torch.no_grad():
                         vals[ci] = float(prob_fn(x_m).mean().item())
-                elif method_name in ("actor", "lstm_vae"):
-                    model_obj = actor_shap if method_name == "actor" else lstm_vae
+                elif method_name in ("actor", "lstm_vae", "flow_matching"):
+                    if method_name == "actor":
+                        model_obj = actor_shap
+                    elif method_name == "lstm_vae":
+                        model_obj = lstm_vae
+                    else:
+                        model_obj = flow_matching
                     comps = model_obj.sample_completions(
                         x_i, y_i.to(device), mask_i.to(device), lengths_t.to(device),
                         cm.to(device), n_samples=args.n_completion_samples,
@@ -1157,6 +1273,22 @@ def parse_args() -> argparse.Namespace:
                         help="Directory containing lstm_vae_config.json + lstm_vae_model.pt "
                              "(produced by train_lstm_vae_synthetic.py). "
                              "Usually the same as --ckpt_dir when --actor_data_dir was used.")
+        sp.add_argument("--flow_ckpt_dir", default=None,
+                        help="Directory produced by train_flow_matching.py "
+                             "(must contain last.ckpt or flow_matching_*_best.ckpt). "
+                             "If set, flow_matching is added as a SHAP method via "
+                             "RePaint-style conditional ODE completion.")
+        sp.add_argument("--flow_config", default=None,
+                        help="Path to the flow-matching JSON config used to train the "
+                             "checkpoint in --flow_ckpt_dir (required when --flow_ckpt_dir is set).")
+        sp.add_argument("--flow_num_steps", type=int, default=100,
+                        help="Number of ODE steps for conditional completion "
+                             "(100 recommended with midpoint solver).")
+        sp.add_argument("--flow_solver", default="midpoint",
+                        choices=("euler", "midpoint"),
+                        help="ODE solver for flow-matching conditional completion. "
+                             "Midpoint (RK2) is ~2x slower per step but substantially "
+                             "more accurate.")
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--n_test_sequences", type=int, default=100,
                         help="Cap on test sequences to evaluate (0 = all).")
