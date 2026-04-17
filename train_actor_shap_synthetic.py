@@ -41,7 +41,6 @@ Diagnostic benchmark:
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 import os
 
@@ -438,13 +437,12 @@ def main() -> None:
     if args.lr_decoder is None:
         args.lr_decoder = args.lr / 10.0
 
+    torch.set_float32_matmul_precision("high")
+
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_tag = (
-        f"actor_shap_synthetic_{args.data_mode}"
-        f"_{datetime.datetime.now():%Y%m%d_%H%M%S}"
-    )
+    run_tag = f"actor_shap_synthetic_{args.data_mode}"
     ckpt_dir = os.path.join(args.checkpoint_dir, run_tag)
     os.makedirs(ckpt_dir, exist_ok=True)
     with open(os.path.join(ckpt_dir, "config.json"), "w") as f:

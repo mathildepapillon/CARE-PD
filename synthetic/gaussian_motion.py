@@ -69,6 +69,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from scipy.special import ndtr as _ndtr  # standard normal CDF Φ
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -124,6 +125,68 @@ def _solve_shapley_wls(
     b = (Z * sq).T @ (v[keep] * sq[:, 0])
     theta = np.linalg.solve(A, b)
     return theta[1:]
+
+
+# ---------------------------------------------------------------------------
+# Nonlinear response function — Olsen et al. (JMLR 2022) Eq. (12) adaptation
+# ---------------------------------------------------------------------------
+
+def _per_window_grand_means(
+    x: np.ndarray,
+    window_assignments: list[list[int]],
+) -> np.ndarray:
+    """Per-window scalar grand means: mean over all (j, f) in each window.
+
+    Parameters
+    ----------
+    x : (N, J, F, T)
+    window_assignments : K lists of frame indices
+
+    Returns
+    -------
+    w : (N, K) float64
+    """
+    return np.stack(
+        [x[:, :, :, frames].mean(axis=(1, 2, 3)) for frames in window_assignments],
+        axis=1,
+    )
+
+
+def nonlinear_olsen_score(
+    x: np.ndarray,
+    window_assignments: list[list[int]],
+    sigma_k: np.ndarray,
+    coeffs: np.ndarray,
+) -> np.ndarray:
+    """Nonlinear response adapted from Olsen et al. (JMLR 2022) Eq. (12), K=4 windows.
+
+    Maps sequences (N, J, F, T) → scalar score (N,) via:
+
+        w_k  = mean of all (j, f, t) in window k          (per-window grand mean)
+        u_k  = Φ(w_k / σ_k)                               (CDF → approx. Uniform[0,1])
+        score = c₁·sin(π·u₀·u₁) + c₂·u₂·exp(c₃·u₂·u₃)  (nonlinear + interactions)
+
+    Windows 0&1 interact in the sin term; windows 2&3 interact in the exp term.
+    All four windows influence the score, with different structural roles.
+
+    Parameters
+    ----------
+    x : (N, J, F, T)
+    window_assignments : K=4 lists of frame indices (from GaussianMotionBenchmark)
+    sigma_k : (K,) per-window standard deviations for standardisation
+    coeffs  : (3,) = [c1, c2, c3]
+
+    Returns
+    -------
+    score : (N,) float64
+    """
+    w = _per_window_grand_means(x, window_assignments)  # (N, K)
+    u = _ndtr(w / (sigma_k[np.newaxis] + 1e-12))        # (N, K), ≈ Uniform[0,1]
+    c1, c2, c3 = coeffs
+    return (
+        c1 * np.sin(np.pi * u[:, 0] * u[:, 1])
+        + c2 * u[:, 2] * np.exp(c3 * u[:, 2] * u[:, 3])
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +247,87 @@ class GaussianMotionBenchmark:
         # Precompute Cholesky + mean-weight matrices for all 14 non-trivial coalitions.
         self._cond_cache: dict[tuple, tuple] = {}
         self._precompute_conditionals()
+
+        # Label function config (set by setup_label_fn; None until then).
+        # Stored in the pickle so train/val/test always use identical labelling.
+        self.label_config: dict | None = None
+
+    # ------------------------------------------------------------------
+    # Label function — Olsen et al. (2022) Eq. (12) adaptation
+    # ------------------------------------------------------------------
+
+    def setup_label_fn(
+        self,
+        n_calib: int = 5000,
+        seed: int = 999,
+        noise_std: float = 0.0,
+    ) -> None:
+        """Fit and store the canonical nonlinear label function.
+
+        Draws a calibration sample to estimate per-window standard deviations
+        (σ_k) and samples the three response coefficients (c1, c2, c3).  The
+        result is saved in ``self.label_config`` and persisted with the pickle.
+
+        Call this once when creating the benchmark; all subsequent calls to
+        ``canonical_label_fn`` and ``build_pytorch_dataset`` will use the
+        stored config so that train / val / test splits see identical labels.
+
+        Parameters
+        ----------
+        n_calib : int
+            Number of calibration sequences used to estimate σ_k.
+        seed : int
+            RNG seed for coefficient sampling and calibration data.
+        noise_std : float
+            Gaussian noise added to the score before quantile-binning
+            (0 = deterministic labels, consistent with the paper's default).
+        """
+        rng = np.random.default_rng(seed)
+
+        # Calibration sample to estimate per-window std σ_k.
+        x_cal = self.sample(n_calib, seed=int(rng.integers(2**30)))
+        w_cal = _per_window_grand_means(x_cal, self.window_assignments)  # (n_calib, K)
+        sigma_k = w_cal.std(axis=0).clip(min=1e-8)  # (K,)
+
+        # Coefficients following the paper's spirit: c1 in [0.5, 2], c2 in [0.5, 2],
+        # c3 in [0.5, 1.0] (kept small so exp(c3·u·v) ≤ e ≈ 2.7 stays bounded).
+        c1 = float(rng.uniform(0.5, 2.0))
+        c2 = float(rng.uniform(0.5, 2.0))
+        c3 = float(rng.uniform(0.5, 1.0))
+
+        self.label_config = {
+            "sigma_k":   sigma_k,
+            "coeffs":    np.array([c1, c2, c3]),
+            "noise_std": noise_std,
+            "seed":      seed,
+        }
+
+    def canonical_label_fn(
+        self,
+        x: np.ndarray,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Apply the stored nonlinear label function to sequences x (N, J, F, T).
+
+        Raises ``RuntimeError`` if ``setup_label_fn`` has not been called.
+
+        Returns
+        -------
+        y : (N,) int64 in {0, 1, 2} (quantile-binned score).
+        """
+        if self.label_config is None:
+            raise RuntimeError(
+                "Call bench.setup_label_fn() before using canonical_label_fn."
+            )
+        cfg = self.label_config
+        score = nonlinear_olsen_score(
+            x, self.window_assignments, cfg["sigma_k"], cfg["coeffs"],
+        )
+        if cfg["noise_std"] > 0:
+            _rng = rng if rng is not None else np.random.default_rng(cfg["seed"] + 1)
+            score = score + _rng.normal(0, cfg["noise_std"], size=len(score))
+        q33, q67 = np.percentile(score, [33, 67])
+        return np.where(score < q33, 0, np.where(score < q67, 1, 2)).astype(np.int64)
 
     # ------------------------------------------------------------------
     # Precomputation
@@ -422,10 +566,14 @@ class GaussianMotionBenchmark:
         x = self.sample(N, seed=seed)   # (N, J, F, T)
 
         if label_fn is None:
-            # Default: label = quantile bin of mean joint-0 x-position across time.
-            score = x[:, 0, 0, :].mean(axis=-1)  # (N,)
-            q33, q67 = np.percentile(score, [33, 67])
-            y = np.where(score < q33, 0, np.where(score < q67, 1, 2)).astype(np.int64)
+            if self.label_config is not None:
+                # Use the stored nonlinear canonical label function.
+                y = self.canonical_label_fn(x)
+            else:
+                # Fallback: quantile binning of joint-0 grand mean (legacy).
+                score = x[:, 0, 0, :].mean(axis=-1)  # (N,)
+                q33, q67 = np.percentile(score, [33, 67])
+                y = np.where(score < q33, 0, np.where(score < q67, 1, 2)).astype(np.int64)
         else:
             y = label_fn(x).astype(np.int64)
 
@@ -455,14 +603,24 @@ class GaussianMotionBenchmark:
 # ---------------------------------------------------------------------------
 
 class SyntheticMLPClassifier(nn.Module):
-    """Small MLP that classifies synthetic motion sequences.
+    """Black-box MLP classifier for the Gaussian motion benchmark.
 
-    Input: per-window mean joint positions → (K * J * F,) feature vector.
-    Two hidden layers, 3-class output.
+    Architecture mirrors Olsen et al. (2022) Section 4.2: the classifier sees
+    the same K per-window grand-mean features that determine the nonlinear
+    Shapley label, making it a genuine black-box the SHAP methods must explain.
 
-    The per-window feature makes temporal imputation quality directly
-    affect classifier output, so EC1/EC2/EC3 differences between SHAP
-    methods are meaningful.
+    Feature extraction
+    ------------------
+    For each of the K temporal windows:
+        w_k = mean of x over all (joint, feature, time) in that window  → scalar
+    Input to the MLP: (w_0, w_1, w_2, w_3) — K=4 dimensional.
+
+    Why grand means?  The nonlinear response
+        score = c1·sin(π·u0·u1) + c2·u2·exp(c3·u2·u3)
+    depends only on these K per-window aggregates.  Using higher-dimensional
+    per-(joint, feature) means would give the MLP spurious noise dimensions.
+
+    Architecture: K → BatchNorm → 64 → ReLU → 64 → ReLU → num_classes
     """
 
     def __init__(
@@ -472,15 +630,15 @@ class SyntheticMLPClassifier(nn.Module):
         T: int = 81,
         K: int = 4,
         num_classes: int = 3,
-        hidden: int = 128,
+        hidden: int = 64,
     ):
         super().__init__()
         quarter = T // K
         self.window_starts = [k * quarter for k in range(K)]
         self.window_ends   = [(k + 1) * quarter if k < K - 1 else T for k in range(K)]
-        in_dim = K * J * F
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+            nn.BatchNorm1d(K),
+            nn.Linear(K, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -488,11 +646,12 @@ class SyntheticMLPClassifier(nn.Module):
         )
 
     def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, J, F, T) → feature: (B, K*J*F) per-window means."""
-        feats = []
-        for s, e in zip(self.window_starts, self.window_ends):
-            feats.append(x[:, :, :, s:e].mean(dim=-1))  # (B, J, F)
-        return torch.cat([f.flatten(1) for f in feats], dim=1)
+        """x: (B, J, F, T) → (B, K) per-window grand means."""
+        feats = [
+            x[:, :, :, s:e].mean(dim=(1, 2, 3))  # (B,)
+            for s, e in zip(self.window_starts, self.window_ends)
+        ]
+        return torch.stack(feats, dim=1)  # (B, K)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(self._extract_features(x))
@@ -584,8 +743,8 @@ def build_gaussian_benchmark_and_classifier(
     T: int = 81,
     K: int = 4,
     n_train: int = 2000,
-    n_val: int = 500,
-    n_test: int = 100,
+    n_val: int = 1000,
+    n_test: int = 500,
     clf_epochs: int = 80,
     seed: int = 0,
     device: torch.device | None = None,
@@ -603,23 +762,15 @@ def build_gaussian_benchmark_and_classifier(
     bench, classifier, train_ds, val_ds, test_ds
     """
     bench = GaussianMotionBenchmark(J=J, F=F, T=T, rho=rho, alpha=alpha, K=K)
+    bench.setup_label_fn(n_calib=5000, seed=seed + 99)
 
     x_tr = bench.sample(n_train, seed=seed)
     x_va = bench.sample(n_val,   seed=seed + 1)
     x_te = bench.sample(n_test,  seed=seed + 2)
 
-    # Label function: quantile binning of a random linear combination of joint means.
-    rng_lbl = np.random.default_rng(seed + 99)
-    w_lbl = rng_lbl.standard_normal(J * F)  # (J*F,)
-    def _label_fn(x_arr: np.ndarray) -> np.ndarray:
-        # x_arr: (N, J, F, T) → (N, J*F) mean over T → dot with w_lbl
-        score = x_arr.mean(axis=-1).reshape(len(x_arr), -1) @ w_lbl
-        q33, q67 = np.percentile(score, [33, 67])
-        return np.where(score < q33, 0, np.where(score < q67, 1, 2)).astype(np.int64)
-
-    y_tr = _label_fn(x_tr)
-    y_va = _label_fn(x_va)
-    y_te = _label_fn(x_te)
+    y_tr = bench.canonical_label_fn(x_tr)
+    y_va = bench.canonical_label_fn(x_va)
+    y_te = bench.canonical_label_fn(x_te)
 
     # Build datasets in ACTOR (T-first) format.
     def _make_ds(x_arr, y_arr):
@@ -649,7 +800,7 @@ if __name__ == "__main__":
     assert x.shape == (10, 5, 1, 16), x.shape
 
     x0 = x[0]  # (J, F, T)
-    samps = bench.conditional_sample(x0, s_obs=(0, 2), s_hid=(1, 3), n_samples=100)
+    samps = bench.conditional_sample(x0, s_obs=(0, 2), s_hid=(1, 3), n_samples=1000)
     assert samps.shape == (100, 5, 1, 16), samps.shape
     # Observed windows should be unchanged.
     for k in [0, 2]:

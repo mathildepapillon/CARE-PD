@@ -86,6 +86,98 @@ from synthetic.diagnostic_motion import LinearDiagnosticClassifier, DIAGNOSTIC_J
 # Shared: model loading
 # ---------------------------------------------------------------------------
 
+# ---- LstmVAE wrapper -------------------------------------------------------
+
+class LstmVaeSyntheticWrapper:
+    """Minimal sample_completions wrapper for LstmVAE on synthetic data.
+
+    Mirrors the ActorSHAP.sample_completions interface so it can be dropped
+    into the same evaluation loops.  No root-centering is applied (synthetic
+    data has no global pelvis trajectory).
+    """
+
+    def __init__(self, model, device: torch.device) -> None:
+        from model.lstm_vae.model import LstmVAE  # noqa: F401 — import check only
+        self._model = model
+        self._device = device
+        self._model.to(device)
+        self._model.eval()
+
+    @torch.no_grad()
+    def sample_completions(
+        self,
+        x: torch.Tensor,           # (1, J, F, T)
+        y: torch.Tensor,           # (1,)
+        mask: torch.Tensor,        # (1, T)
+        lengths: torch.Tensor,     # (1,)
+        coalition_mask: torch.Tensor,  # (1, T) temporal or (1, J) spatial
+        n_samples: int = 20,
+    ) -> list[torch.Tensor]:
+        """Return a list of n_samples completions, each (1, J, F, T)."""
+        B, J, F, T = x.shape
+        x_bti = x.permute(0, 3, 1, 2).reshape(B, T, J * F).to(self._device)
+        cm = coalition_mask.to(self._device)
+
+        log_pi, mu, logvar = self._model.forward_masked(x_bti, cm)
+        log_pi_n = log_pi.expand(n_samples, -1)
+        mu_n     = mu.expand(n_samples, -1, -1)
+        lv_n     = logvar.expand(n_samples, -1, -1)
+
+        z = self._model.masked_encoder.sample(log_pi_n, mu_n, lv_n)
+        recon = self._model.decode(z, seq_len=T)  # (N, T, J*F)
+
+        # Paste observed frames/joints back.
+        gt_exp = x_bti.expand(n_samples, -1, -1)
+        cm_exp = cm.expand(n_samples, -1)
+        if cm.shape[-1] == J:
+            # Spatial mask (N, J)
+            gt4 = gt_exp.reshape(n_samples, T, J, F)
+            rc4 = recon.reshape(n_samples, T, J, F)
+            obs = cm_exp[:, None, :, None].expand_as(gt4)
+            recon = torch.where(obs, gt4, rc4).reshape(n_samples, T, J * F)
+        else:
+            # Temporal mask (N, T)
+            obs = cm_exp[:, :, None].expand_as(gt_exp)
+            recon = torch.where(obs, gt_exp, recon)
+
+        actor = recon.reshape(n_samples, T, J, F).permute(0, 2, 3, 1)  # (N, J, F, T)
+        return [actor[i : i + 1] for i in range(n_samples)]
+
+
+def load_lstm_vae(ckpt_dir: str, device: torch.device) -> LstmVaeSyntheticWrapper:
+    """Load a trained LstmVAE from lstm_vae_config.json + lstm_vae_model.pt."""
+    from model.lstm_vae.model import LstmVAE
+
+    cfg_path = os.path.join(ckpt_dir, "lstm_vae_config.json")
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(
+            f"lstm_vae_config.json not found in {ckpt_dir}.\n"
+            "Run train_lstm_vae_synthetic.py --actor_data_dir <ckpt_dir> first."
+        )
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    model = LstmVAE(
+        input_dim=cfg["input_dim"],
+        encoder_hidden_dim=cfg.get("encoder_hidden_dim", 256),
+        encoder_num_layers=cfg.get("encoder_num_layers", 2),
+        decoder_hidden_dim=cfg.get("decoder_hidden_dim", 256),
+        decoder_num_layers=cfg.get("decoder_num_layers", 4),
+        latent_dim=cfg["latent_dim"],
+        seq_len=cfg["seq_len"],
+        dropout=cfg.get("dropout", 0.1),
+        n_mix=cfg["n_mix"],
+    )
+
+    pt_path = os.path.join(ckpt_dir, "lstm_vae_model.pt")
+    if not os.path.exists(pt_path):
+        raise FileNotFoundError(f"lstm_vae_model.pt not found in {ckpt_dir}.")
+    state = torch.load(pt_path, map_location="cpu")
+    model.load_state_dict(state)
+    print(f"[Load] LstmVAE ← {pt_path}")
+    return LstmVaeSyntheticWrapper(model, device)
+
+
 def load_actor_shap(ckpt_dir: str, device: torch.device) -> ActorSHAP:
     """Rebuild ActorSHAP from config.json + last checkpoint in ckpt_dir."""
     cfg_path = os.path.join(ckpt_dir, "config.json")
@@ -407,6 +499,7 @@ def evaluate_temporal_shap_all_methods(
     device: torch.device | None = None,
     rng: np.random.Generator | None = None,
     seed: int | None = None,
+    lstm_vae: "LstmVaeSyntheticWrapper | None" = None,
 ) -> dict[str, dict]:
     """Evaluate all SHAP methods for one test sequence.
 
@@ -568,6 +661,31 @@ def evaluate_temporal_shap_all_methods(
             with torch.no_grad():
                 v_actor[i] = float(prob_fn(x_batch).mean().item())
     results["actor"] = {"v": v_actor, "phi": _v_to_phi(v_actor)}
+
+    # ---- LstmVAE method (optional) ------------------------------------------
+    if lstm_vae is not None:
+        print("lstm_vae ...", end=" ", flush=True)
+        v_lstm = np.zeros(N_coal)
+        for i, (z, cm) in enumerate(zip(coalitions, all_cms)):
+            s_obs, s_hid = _split(z)
+            if not s_hid:
+                with torch.no_grad():
+                    v_lstm[i] = float(prob_fn(x.to(device)).item())
+            elif not s_obs:
+                idxs = rng.integers(0, len(train_pool), size=n_completion_samples)
+                x_marg = train_pool[idxs].to(device)
+                with torch.no_grad():
+                    v_lstm[i] = float(prob_fn(x_marg).mean().item())
+            else:
+                comps = lstm_vae.sample_completions(
+                    x.to(device), y.to(device), mask.to(device), lengths.to(device),
+                    cm.to(device), n_samples=n_completion_samples,
+                )
+                x_batch = torch.cat(comps, dim=0)
+                with torch.no_grad():
+                    v_lstm[i] = float(prob_fn(x_batch).mean().item())
+        results["lstm_vae"] = {"v": v_lstm, "phi": _v_to_phi(v_lstm)}
+
     print("done.")
 
     return results
@@ -699,6 +817,13 @@ def run_gaussian(args: argparse.Namespace) -> None:
     # Convert to (N, J, F, T) format.
     x_test_jft = x_test_bttf.permute(0, 2, 3, 1).contiguous()  # (N, J, F, T)
 
+    # Classifier test accuracy.
+    with torch.no_grad():
+        logits_all = clf(x_test_jft.to(device))
+        preds_all  = logits_all.argmax(dim=-1).cpu()
+    acc = (preds_all == y_test).float().mean().item()
+    print(f"[Gaussian] Classifier test accuracy: {acc:.1%}  ({(preds_all == y_test).sum().item()}/{len(y_test)})")
+
     # Load train pool for marginal/mean.
     x_train_jft = np.load(os.path.join(ckpt_dir, "x_train_jft.npy"))  # (N_tr, J, F, T)
     train_pool = torch.tensor(x_train_jft)  # (N_tr, J, F, T)
@@ -717,6 +842,12 @@ def run_gaussian(args: argparse.Namespace) -> None:
 
     # Load ActorSHAP.
     actor_shap = load_actor_shap(ckpt_dir, device)
+
+    # Optionally load LstmVAE.
+    lstm_vae = None
+    lstm_vae_ckpt_dir = getattr(args, "lstm_vae_ckpt_dir", None)
+    if lstm_vae_ckpt_dir:
+        lstm_vae = load_lstm_vae(lstm_vae_ckpt_dir, device)
 
     # Probability function: class 0 probability.
     class_idx = args.class_idx
@@ -760,6 +891,7 @@ def run_gaussian(args: argparse.Namespace) -> None:
             n_completion_samples=args.n_completion_samples,
             device=device,
             rng=rng,
+            lstm_vae=lstm_vae,
         )
         results_per_seq.append(res)
 
@@ -767,6 +899,8 @@ def run_gaussian(args: argparse.Namespace) -> None:
     methods = ["actor", "zero", "mean", "marginal", "gaussian_temporal"]
     if gauss_full is not None:
         methods.append("gaussian_full")
+    if lstm_vae is not None:
+        methods.append("lstm_vae")
 
     summary = compute_ec_metrics(results_per_seq, methods)
     print_ec_table(summary, rho=bench.rho, alpha=bench.alpha)
@@ -824,6 +958,16 @@ def run_diagnostic(args: argparse.Namespace) -> None:
     if mu_j is not None:
         clf.register_buffer("mu_j", torch.tensor(mu_j))
 
+    # Classifier test performance (Pearson r²).
+    with torch.no_grad():
+        preds_diag = clf(x_test_jft.to(device)).cpu().numpy()
+    y_np = y_test.numpy() if isinstance(y_test, torch.Tensor) else np.array(y_test)
+    ss_res = ((y_np - preds_diag) ** 2).sum()
+    ss_tot = ((y_np - y_np.mean()) ** 2).sum()
+    r2 = 1 - ss_res / (ss_tot + 1e-12)
+    corr = float(np.corrcoef(y_np, preds_diag)[0, 1])
+    print(f"[Diagnostic] Classifier test R²={r2:.3f}  Pearson r={corr:.3f}  ({len(y_np)} samples)")
+
     def prob_fn(x_in: torch.Tensor) -> torch.Tensor:
         return clf(x_in.to(device))  # (B,) scalar
 
@@ -835,6 +979,12 @@ def run_diagnostic(args: argparse.Namespace) -> None:
     # Load ActorSHAP.
     actor_shap = load_actor_shap(ckpt_dir, device)
 
+    # Optionally load LstmVAE.
+    lstm_vae = None
+    lstm_vae_ckpt_dir = getattr(args, "lstm_vae_ckpt_dir", None)
+    if lstm_vae_ckpt_dir:
+        lstm_vae = load_lstm_vae(lstm_vae_ckpt_dir, device)
+
     # Spatial SHAP: M=17 players. Run KernelSHAP for each method.
     M = 17
     rng = np.random.default_rng(args.seed)
@@ -842,7 +992,10 @@ def run_diagnostic(args: argparse.Namespace) -> None:
     n_test = min(len(x_test_np), args.n_test_sequences)
     print(f"[Diagnostic] Evaluating {n_test} test sequences, M={M} spatial joints …")
 
-    all_phi: dict[str, list] = {m: [] for m in ["actor", "zero", "mean", "marginal"]}
+    _diag_methods = ["actor", "zero", "mean", "marginal"]
+    if lstm_vae is not None:
+        _diag_methods.append("lstm_vae")
+    all_phi: dict[str, list] = {m: [] for m in _diag_methods}
     phi_true_list = []
     lengths_t = torch.tensor([T])
 
@@ -868,7 +1021,7 @@ def run_diagnostic(args: argparse.Namespace) -> None:
         all_cms_with_bounds = [zero_cm, full_cm] + cms_list
 
         # Value function per method.
-        for method_name in ["actor", "zero", "mean", "marginal"]:
+        for method_name in _diag_methods:
             vals = np.zeros(len(all_cms_with_bounds))
             for ci, cm in enumerate(all_cms_with_bounds):
                 hid_joints = (~cm[0]).nonzero(as_tuple=True)[0].cpu().numpy()
@@ -882,8 +1035,9 @@ def run_diagnostic(args: argparse.Namespace) -> None:
                     x_m = train_pool[idxs].to(device)
                     with torch.no_grad():
                         vals[ci] = float(prob_fn(x_m).mean().item())
-                elif method_name == "actor":
-                    comps = actor_shap.sample_completions(
+                elif method_name in ("actor", "lstm_vae"):
+                    model_obj = actor_shap if method_name == "actor" else lstm_vae
+                    comps = model_obj.sample_completions(
                         x_i, y_i.to(device), mask_i.to(device), lengths_t.to(device),
                         cm.to(device), n_samples=args.n_completion_samples,
                     )
@@ -920,7 +1074,7 @@ def run_diagnostic(args: argparse.Namespace) -> None:
 
     # Compute diagnostics.
     print("\n[Diagnostic] Summary")
-    methods = ["actor", "zero", "mean", "marginal"]
+    methods = _diag_methods
     phi_true_arr = np.array(phi_true_list)  # (N, J)
 
     diag_results: dict[str, dict] = {}
@@ -999,10 +1153,14 @@ def parse_args() -> argparse.Namespace:
     def _add_common(sp):
         sp.add_argument("--ckpt_dir", required=True,
                         help="Directory produced by train_actor_shap_synthetic.py.")
+        sp.add_argument("--lstm_vae_ckpt_dir", default=None,
+                        help="Directory containing lstm_vae_config.json + lstm_vae_model.pt "
+                             "(produced by train_lstm_vae_synthetic.py). "
+                             "Usually the same as --ckpt_dir when --actor_data_dir was used.")
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--n_test_sequences", type=int, default=100,
                         help="Cap on test sequences to evaluate (0 = all).")
-        sp.add_argument("--n_completion_samples", type=int, default=20,
+        sp.add_argument("--n_completion_samples", type=int, default=50,
                         help="Stochastic completions per coalition.")
         sp.add_argument("--output_dir", default=None,
                         help="Directory for output JSON files (default: <ckpt_dir>/eval_…).")
