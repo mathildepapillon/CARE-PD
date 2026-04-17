@@ -49,6 +49,17 @@ from model.flow_matching import VelocityNet
 from train_flow_matching import FlowClipDataset, VelocityModelWrapper, masked_mse
 
 
+H36M_JOINT_NAMES: list[str] = [
+    "Pelvis",
+    "RHip", "RKnee", "RAnkle",
+    "LHip", "LKnee", "LAnkle",
+    "Spine", "Thorax", "Neck",
+    "Head",
+    "LShoulder", "LElbow", "LWrist",
+    "RShoulder", "RElbow", "RWrist",
+]
+
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
@@ -129,6 +140,60 @@ def bucketed_val_loss(
                     count_sum[bi] += real_scalars
 
     return loss_sum / np.maximum(count_sum, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Metric 1b: per-joint bucketed val loss
+# ---------------------------------------------------------------------------
+
+def per_joint_bucketed_loss(
+    net: VelocityNet,
+    val_loader: DataLoader,
+    buckets: list[tuple[float, float]],
+    k_per_bucket: int,
+    device: torch.device,
+) -> np.ndarray:
+    """Masked MSE per ``(bucket, joint)``, averaged over (coords, frames, clips).
+
+    Returns an array of shape ``(n_buckets, J)`` in z-score squared units. Each
+    joint's MSE is directly comparable to the global ``bucketed_val_loss``
+    because we use the same z-score normalisation.
+    """
+    path = AffineProbPath(scheduler=CondOTScheduler())
+    n_b = len(buckets)
+
+    per_bucket_joint_sqsum: np.ndarray | None = None
+    per_bucket_count: np.ndarray | None = None
+
+    with torch.no_grad():
+        for batch in val_loader:
+            x1 = batch["x1"].to(device)                          # (B, T, J, C)
+            mask = batch["mask"].to(device)                      # (B, T)
+            B, T, J, C = x1.shape
+            if per_bucket_joint_sqsum is None:
+                per_bucket_joint_sqsum = np.zeros((n_b, J), dtype=np.float64)
+                per_bucket_count = np.zeros((n_b, J), dtype=np.float64)
+
+            m = mask.to(x1.dtype)                                # (B, T)
+            frames_real = float(m.sum().item())
+            # For each joint we accumulate C*(# real frames) scalar residuals.
+            count_per_joint = frames_real * C
+
+            for bi, (lo, hi) in enumerate(buckets):
+                for _ in range(k_per_bucket):
+                    t = torch.rand(B, device=device) * (hi - lo) + lo
+                    x0 = torch.randn_like(x1)
+                    sample = path.sample(t=t, x_0=x0, x_1=x1)
+                    v = net(sample.x_t, sample.t, mask=mask)     # (B, T, J, C)
+                    diff2 = (v - sample.dx_t).pow(2)              # (B, T, J, C)
+                    diff2 = diff2 * m[:, :, None, None]           # mask frames
+                    # Sum over batch, frames, coords -> (J,)
+                    per_joint_sum = diff2.sum(dim=(0, 1, 3))
+                    per_bucket_joint_sqsum[bi] += per_joint_sum.detach().cpu().numpy()
+                    per_bucket_count[bi] += count_per_joint
+
+    assert per_bucket_joint_sqsum is not None and per_bucket_count is not None
+    return per_bucket_joint_sqsum / np.maximum(per_bucket_count, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +338,13 @@ def main() -> None:
                    help="Cap on val batches used for the round-trip test (expensive).")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--per_joint", action="store_true",
+                   help="Additionally report per-joint bucketed MSE (z-score units).")
+    p.add_argument("--skip_recon", action="store_true",
+                   help="Skip the partial-reconstruction and round-trip tests "
+                        "(useful when only per-joint numbers are needed).")
+    p.add_argument("--out_json", default=None,
+                   help="Optional path to dump all numeric results as JSON.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -325,6 +397,52 @@ def main() -> None:
     overall = float(losses.mean())
     print(f"    {'mean':>14}  {overall:>8.4f}  {_pct_of_baseline(overall):>17.1f}%")
 
+    results: dict = {
+        "config":      args.config,
+        "checkpoint":  ckpt_path,
+        "buckets":     [[lo, hi] for (lo, hi) in buckets],
+        "bucket_loss": [float(x) for x in losses],
+        "bucket_loss_mean": overall,
+    }
+
+    # ------------------------------------------------------------------
+    # 1b. Per-joint bucketed val loss
+    # ------------------------------------------------------------------
+    if args.per_joint:
+        print("\n=== 1b) Per-joint bucketed val loss (masked MSE, z-score units) ===")
+        pj = per_joint_bucketed_loss(net, val_loader, buckets, args.k_per_bucket, device)
+        # Per-joint aggregate over buckets (mean).
+        pj_mean = pj.mean(axis=0)  # (J,)
+        # Sort joints by mean loss (descending) to highlight worst offenders.
+        order = np.argsort(-pj_mean)
+        hdr = (
+            f"{'joint':>4} {'name':>10}  "
+            + "  ".join(f"[{lo:.1f},{hi:.1f})" for (lo, hi) in buckets)
+            + f"  {'mean':>8}  {'rel':>6}"
+        )
+        print("    " + hdr)
+        base = float(pj_mean.mean())
+        for j in order:
+            row = "  ".join(f"{pj[b, j]:>8.4f}" for b in range(len(buckets)))
+            rel = pj_mean[j] / max(base, 1e-12)
+            print(
+                f"    {int(j):>4d} {H36M_JOINT_NAMES[j]:>10}  {row}  "
+                f"{pj_mean[j]:>8.4f}  {rel:>6.2f}x"
+            )
+        results["per_joint_bucket_loss"] = pj.tolist()
+        results["per_joint_mean_loss"]   = pj_mean.tolist()
+        results["joint_names"]           = H36M_JOINT_NAMES
+
+    if args.skip_recon:
+        if args.out_json:
+            Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.out_json, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"\n[done] wrote {args.out_json}")
+        else:
+            print("\n[done]")
+        return
+
     # ------------------------------------------------------------------
     # 2. Partial noise-denoise reconstruction MPJPE
     # ------------------------------------------------------------------
@@ -366,7 +484,30 @@ def main() -> None:
         f"{np.percentile(rt, 90):>8.1f}  {np.percentile(rt, 95):>8.1f}  {rt.max():>8.1f}"
     )
 
-    print("\n[done]")
+    results["round_trip_mpjpe_mm"] = {
+        "clips":  int(len(rt)),
+        "mean":   float(rt.mean()),
+        "median": float(np.median(rt)),
+        "p90":    float(np.percentile(rt, 90)),
+        "p95":    float(np.percentile(rt, 95)),
+        "max":    float(rt.max()),
+    }
+    results["partial_reconstruction_mpjpe_mm"] = {
+        str(s): {
+            "mean":   float(recon[s].mean()),
+            "median": float(np.median(recon[s])),
+            "p95":    float(np.percentile(recon[s], 95)),
+        }
+        for s in s_list
+    }
+
+    if args.out_json:
+        Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.out_json, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\n[done] wrote {args.out_json}")
+    else:
+        print("\n[done]")
 
 
 if __name__ == "__main__":
