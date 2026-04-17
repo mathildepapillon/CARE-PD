@@ -3,8 +3,30 @@
 from __future__ import annotations
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
+
+
+class EpochProgressPrinter(Callback):
+    """Prints a plain-text epoch summary line that survives `tee` and log files."""
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if trainer.sanity_checking or not trainer.is_global_zero:
+            return
+        metrics = trainer.callback_metrics
+        parts = [f"epoch {trainer.current_epoch:>4d}/{trainer.max_epochs}"]
+        for key in ("train/loss", "val/loss", "val/mixed", "train/mixed"):
+            if key in metrics:
+                parts.append(f"{key}={metrics[key]:.4f}")
+        # Fall back to any logged val_ or train_ scalars not already captured.
+        for k, v in metrics.items():
+            label = k.replace("train/", "").replace("val/", "")
+            if not any(label in p for p in parts):
+                try:
+                    parts.append(f"{k}={float(v):.4f}")
+                except (TypeError, ValueError):
+                    pass
+        print("  ".join(parts), flush=True)
 
 
 def make_trainer(
@@ -66,6 +88,7 @@ def make_trainer(
             ),
         ]
 
+    callbacks.append(EpochProgressPrinter())
     if logger:
         callbacks.append(LearningRateMonitor(logging_interval="epoch"))
     if extra_callbacks:

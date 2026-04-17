@@ -1,0 +1,25 @@
+{
+  "flow_config":           "configs/flow_matching/bmclab_h36m3d_fold1.json",
+  "flow_checkpoint":       "experiment_outs/flow_matching/bmclab_h36m3d_fold1/flow_matching_BMCLab_fold1_best.ckpt",
+
+  "backbone":              "potr",
+  "classifier_checkpoint": "experiment_outs/Hypertune/POTR_BMCLab/0/models/train_BMCLab_23fold/fold1/latest_epoch.pth.tr",
+  "classifier_config_file": "BMCLab.json",
+  "classifier_num_folds":  23,
+
+  "class_policy":          "predicted",
+
+  "data": {
+    "dataset":   "BMCLab",
+    "split":     "val",
+    "fold":      1,
+    "max_clips": null
+  },
+
+  "num_ode_steps": 100,
+  "solver":        "midpoint",
+  "batch_size":    16,
+  "device":        "cuda:0",
+  "output_dir":    "experiment_outs/flow_shap/bmclab_potr_fold1",
+  "seed":          42
+}
