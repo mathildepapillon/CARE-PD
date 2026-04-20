@@ -1,0 +1,15 @@
+{
+  "source_ckpt_dir": "/home/papillon/code/CARE-PD/experiment_outs/actor_shap_synthetic/smoke_gaussian",
+  "data_mode": "synthetic_gaussian",
+  "n_train_clips": 270,
+  "n_val_clips": 30,
+  "seq_len": 81,
+  "n_joints": 17,
+  "n_feats": 3,
+  "val_frac": 0.1,
+  "seed": 42,
+  "train_abs_mean_max": 0.04858749202218914,
+  "train_std_max": 1.0134092610904775,
+  "cache_path": "/home/papillon/code/CARE-PD/cache/flow_matching/smoke_gaussian/cache.npz",
+  "sanity_path": "/home/papillon/code/CARE-PD/cache/flow_matching/smoke_gaussian/sanity.npz"
+}

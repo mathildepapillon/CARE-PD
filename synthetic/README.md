@@ -1,259 +1,124 @@
 # Synthetic SHAP Benchmarks
 
-Two synthetic benchmarks for validating that ActorSHAP (and LSTM-VAE) produce
-Shapley values closer to the analytically correct ones than simpler baselines.
+Controlled-ground-truth benchmarks used to evaluate SHAP-imputation and
+Aumann–Shapley methods against **analytically-computable Shapley values**.
+If you want to add a new benchmark, read
+[`docs/CONTRIBUTING-DATASETS.md`](../docs/CONTRIBUTING-DATASETS.md); it walks
+through the interface end-to-end.
 
 ---
 
-## Benchmarks
+## What lives here
 
-### 1. Gaussian Motion (`synthetic_gaussian`)
+```
+synthetic/
+├── __init__.py
+├── gaussian_motion.py   ← the benchmark currently wired into the pipeline
+└── README.md            ← you are here
+```
 
-Temporal motion drawn from a known multivariate Gaussian distribution
-(equicorrelation across joints × AR(1) across time). Because the true
-conditional distribution is analytically Gaussian, the exact Shapley values can
-be computed via Monte Carlo from the known conditionals.
+### `gaussian_motion.py`
 
-- **K = 4 temporal windows** are the SHAP players.
-- **Label function**: nonlinear with interactions across windows, adapted from
-Olsen et al. (JMLR 2022) Eq. (12) — `c₁·sin(π·u₀·u₁) + c₂·u₂·exp(c₃·u₂·u₃)`.
-- **Black-box**: a small MLP trained to predict the quantile-binned label from
-per-window grand means.
-- **Metrics**: EC1 (MAE of Shapley values), EC2 (MSE of contribution functions),
-EC3 (Expected Prediction Error).
+Temporal motion drawn from
 
-### 2. Diagnostic Gait (`synthetic_diagnostic`)
+$$ x \sim \mathcal{N}(0,\; \Sigma_{\text{joints}} \otimes I_F \otimes \Sigma_{\text{time}}) $$
 
-Fourier-series synthetic gait with a known subset of diagnostic joints (right
-leg, spine) that carry label-relevant amplitude signal.
+with `Σ_joints[j,j'] = ρ` (equicorrelation) and `Σ_time[t,t'] = αⁱᵗ⁻ᵗ'ⁱ` (AR(1)).
+Because the full distribution is Gaussian with Kronecker structure, the exact
+conditional `p(x_hidden | x_observed)` is Gaussian with closed-form mean and
+covariance — which is what `GaussianMotionBenchmark.conditional_sample(...)`
+and `conditional_sample_spatial(...)` return. That in turn makes the oracle
+Shapley values computable:
 
-- **Players**: J = 17 joints (spatial SHAP via KernelSHAP).
-- **Black-box**: linear classifier — true Shapley values are analytically exact.
-- **Metrics**: EC1, Top-k joint recovery, Spearman rank correlation.
+- **`player_mode="temporal"`**: K temporal windows are the players
+  (`K ∈ {4, 8, 12}`, must be divisible by 4 so the Olsen-style label tiles
+  cleanly). Oracle Shapley is **exact by 2^K coalition enumeration**.
+- **`player_mode="spatial"`**: J = 17 joints are the players. Oracle Shapley
+  is estimated by **KernelSHAP using the exact joint-conditional Gaussian**
+  as the imputer.
+
+The black-box classifier is `SyntheticMLPClassifier`: a small MLP on top of
+per-window (or per-joint) grand means, with BatchNorm + ReLU non-linearities
+so that classical Shapley and Aumann–Shapley are guaranteed to **diverge**
+(the label interactions cannot be reproduced by an additive decomposition).
+
+Label function — adapted from Olsen et al. (JMLR 2022) Eq. (12):
+
+$$ s(u) = c_1 \sin(\pi u_0 u_1) + c_2 u_2 \exp(c_3 u_2 u_3) $$
+
+tiled across groups of 4 windows for `K > 4`.
 
 ---
 
-## Directory Structure
+## Pipeline (current)
 
-After training, both models save all artifacts to the **same directory**:
+The synthetic benchmark is consumed by five scripts that together reproduce
+the EC1 / EC2 / EC3 tables:
 
+| Stage                       | Script                                                        | Output                                                             |
+|-----------------------------|---------------------------------------------------------------|--------------------------------------------------------------------|
+| 1. Build data + classifier  | `scripts/build_synthetic_gaussian_data.py`                    | `synthetic_benchmark.pkl`, `synthetic_clf.pt`, `synthetic_test.pt` |
+| 2. Flow-training cache      | `scripts/generate_velocity_synthetic.py`                      | `cache.npz`, `sanity.npz`                                          |
+| 3a. Train flow model        | `train_flow_matching.py --config configs/flow_matching/...`   | `last.ckpt` (VelocityNet)                                          |
+| 3b. Train VAEAC baseline    | `train_vaeac.py --config configs/vaeac/synthetic_gaussian.json` | `last.ckpt` (Ivanov/Olsen-faithful VAEAC)                        |
+| 4. OTFlow-SHAP attributions | `scripts/compute_flow_shap_synthetic.py`                      | `psi.npz` (per-element IG)                                         |
+| 5. EC1 / EC2 / EC3 sweep    | `scripts/evaluate_shap_synthetic_gaussian.py`                 | `ec_summary.json`, `per_sequence.json`                             |
+
+**One-shot orchestration** (all five stages):
+
+```bash
+GPU=0 TAG=synthetic_gaussian_k4 K=4 PLAYERS=temporal \
+    bash scripts/run_flow_matching_synthetic.sh
 ```
-experiment_outs/actor_shap_synthetic/actor_shap_synthetic_synthetic_gaussian/
-├── actor_shap_synthetic_last.ckpt  ← ActorSHAP model weights
-├── lstm_vae_model.pt               ← LstmVAE model weights (after Step 2)
-├── lstm_vae_config.json            ← LstmVAE architecture config
-├── synthetic_benchmark.pkl         ← GaussianMotionBenchmark instance
-├── synthetic_clf.pt                ← MLP classifier weights
-├── synthetic_clf_meta.json         ← Classifier metadata (J, F, T, K)
-├── synthetic_test.pt               ← Test tensors (x, y, pad_mask)
-├── x_train_jft.npy                 ← (N_train, J, F, T) training sequences
-└── config.json                     ← CLI arguments used for ActorSHAP training
-```
+
+Key environment-variable knobs (see the script header for the full list):
+
+| Variable            | Default                                                                   | Meaning                                          |
+|---------------------|---------------------------------------------------------------------------|--------------------------------------------------|
+| `K`                 | `4`                                                                       | Number of temporal windows (multiple of 4)       |
+| `PLAYERS`           | `temporal`                                                                | `temporal` (K windows) or `spatial` (J joints)   |
+| `SIGNAL_JOINTS`     | `"0 1 2 3"`                                                               | Signal-carrying joints (spatial mode only)       |
+| `TRAIN_VAEAC`       | `0`                                                                       | Set to `1` to also train the VAEAC baseline      |
+| `FLOW_CKPT_DIR`     | `experiment_outs/flow_matching_synthetic/synthetic_gaussian`              | Reuse an existing flow checkpoint                |
+| `VAEAC_CKPT_DIR`    | `experiment_outs/vaeac_synthetic/synthetic_gaussian`                      | Reuse an existing VAEAC checkpoint               |
+| `N_TEST`            | `100`                                                                     | Number of test sequences for the EC sweep        |
+| `K_MC_TRUE`         | `1000`                                                                    | Monte-Carlo samples for oracle `v(S)`            |
 
 ---
 
-## Quick Start: Gaussian Benchmark
+## What gets compared
 
-### Step 1 — Train ActorSHAP
+The EC sweep runs **all of the following SHAP methods against the same oracle**:
 
-```bash
-python train_actor_shap_synthetic.py \
-    --data_mode synthetic_gaussian \
-    --rho 0.7 --alpha 0.9 \
-    --n_train 10000 --n_val 2000 --n_test 500 \
-    --latent_dim 128 --num_layers 6 --num_heads 4 \
-    --epochs 300 --phase0_epochs 0 \
-    --lambda_kl 0.01 --lambda_rc_psi 1.0 \
-    --mask_axis temporal \
-    --checkpoint_dir experiment_outs/actor_shap_synthetic \
-    2>&1 | tee /tmp/actor_train.log
-```
+| Method            | Imputer                                            | Notes                          |
+|-------------------|----------------------------------------------------|--------------------------------|
+| `zero`            | Replace hidden entries with 0                      | Off-manifold baseline          |
+| `mean`            | Replace with per-joint training mean               | Off-manifold baseline          |
+| `marginal`        | Replace with random training clip                  | On-marginal baseline           |
+| `gaussian_oracle` | Exact Gaussian conditional (analytic)              | Upper bound                    |
+| `flow_matching`   | Trained flow model, RePaint-style sampling         | Our main method                |
+| `vaeac`           | Trained VAEAC, amortised posterior                 | JMLR 2022 baseline (Olsen-faithful) |
 
-Progress is printed per epoch:
-
-```
-epoch    1/300  train/loss=2.3141  val/loss=2.1892  val/mixed=2.1892
-epoch    2/300  ...
-```
-
-Output directory: `experiment_outs/actor_shap_synthetic/actor_shap_synthetic_synthetic_gaussian/`
-
-### Step 2 — Train LstmVAE on the Same Benchmark
-
-Passing `--actor_data_dir` reuses the exact same distribution, benchmark, and
-test split — ensuring a fair comparison.
-
-```bash
-ACTOR_DIR=experiment_outs/actor_shap_synthetic/actor_shap_synthetic_synthetic_gaussian
-
-python train_lstm_vae_synthetic.py \
-    --actor_data_dir "$ACTOR_DIR" \
-    --epochs 300 \
-    --n_mix 5 \
-    --mask_warmup_epochs 20 \
-    --mask_axis temporal \
-    2>&1 | tee /tmp/lstm_train.log
-```
-
-Saves `lstm_vae_model.pt` and `lstm_vae_config.json` into `$ACTOR_DIR`.
-
-### Step 3 — Evaluate Both Models
-
-```bash
-ACTOR_DIR=experiment_outs/actor_shap_synthetic/actor_shap_synthetic_synthetic_gaussian
-
-python evaluate_shap_synthetic.py gaussian \
-    --ckpt_dir "$ACTOR_DIR" \
-    --lstm_vae_ckpt_dir "$ACTOR_DIR" \
-    --device cuda:0 \
-    --K_mc_true 2000 \
-    --n_completion_samples 50 \
-    --n_test_sequences 500 \
-    2>&1 | tee /tmp/eval_gaussian.log
-```
-
-Prints classifier test accuracy, then an EC1/EC2/EC3 table and a LaTeX snippet.
-
----
-
-## Quick Start: Diagnostic Benchmark
-
-### Step 1 — Train ActorSHAP
-
-```bash
-python train_actor_shap_synthetic.py \
-    --data_mode synthetic_diagnostic \
-    --n_train 2000 --n_val 500 --n_test 200 \
-    --mask_axis spatial \
-    --epochs 300 --phase0_epochs 0 \
-    --checkpoint_dir experiment_outs/actor_shap_diagnostic \
-    2>&1 | tee /tmp/actor_diag_train.log
-```
-
-### Step 2 — Train LstmVAE
-
-```bash
-ACTOR_DIR=experiment_outs/actor_shap_diagnostic/actor_shap_synthetic_synthetic_diagnostic
-
-python train_lstm_vae_synthetic.py \
-    --actor_data_dir "$ACTOR_DIR" \
-    --epochs 300 \
-    --mask_axis spatial \
-    2>&1 | tee /tmp/lstm_diag_train.log
-```
-
-### Step 3 — Evaluate
-
-```bash
-ACTOR_DIR=experiment_outs/actor_shap_diagnostic/actor_shap_synthetic_synthetic_diagnostic
-
-python evaluate_shap_synthetic.py diagnostic \
-    --ckpt_dir "$ACTOR_DIR" \
-    --lstm_vae_ckpt_dir "$ACTOR_DIR" \
-    --device cuda:0 \
-    --n_completion_samples 50 \
-    --n_test_sequences 200 \
-    2>&1 | tee /tmp/eval_diag.log
-```
-
----
-
-## Key Arguments
-
-### `train_actor_shap_synthetic.py`
-
-
-| Argument           | Default                                | Description                                                                                   |
-| ------------------ | -------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `--data_mode`      | `synthetic_gaussian`                   | `synthetic_gaussian` or `synthetic_diagnostic`                                                |
-| `--rho`            | `0.5`                                  | Joint equicorrelation strength (Gaussian only)                                                |
-| `--alpha`          | `0.8`                                  | AR(1) temporal correlation (Gaussian only) (making this higher should break marginal further) |
-| `--n_train`        | `2000`                                 | Training sequences (use ≥10000 for paper results)                                             |
-| `--n_val`          | `500`                                  | Validation sequences                                                                          |
-| `--n_test`         | `100`                                  | Test sequences (use ≥500 for stable metrics)                                                  |
-| `--epochs`         | `200`                                  | Training epochs                                                                               |
-| `--phase0_epochs`  | `0`                                    | Warm-up epochs for masked encoder only                                                        |
-| `--mask_axis`      | `temporal`                             | `temporal` (Gaussian) or `spatial` (diagnostic)                                               |
-| `--lambda_kl`      | `0.01`                                 | KL divergence weight                                                                          |
-| `--lambda_rc_psi`  | `1.0`                                  | Masked encoder reconstruction weight                                                          |
-| `--checkpoint_dir` | `experiment_outs/actor_shap_synthetic` | Output root                                                                                   |
-| `--devices`        | *(all GPUs)*                           | Override GPUs, e.g. `0,1`                                                                     |
-| `--seed`           | `0`                                    | Random seed                                                                                   |
-
-
-### `train_lstm_vae_synthetic.py`
-
-
-| Argument               | Default    | Description                                      |
-| ---------------------- | ---------- | ------------------------------------------------ |
-| `--actor_data_dir`     | `None`     | **Recommended**: reuse ActorSHAP's benchmark dir |
-| `--epochs`             | `200`      | Training epochs                                  |
-| `--n_mix`              | `5`        | Mixture components in masked encoder             |
-| `--mask_warmup_epochs` | `20`       | Epochs before masked encoder activates           |
-| `--mask_axis`          | `temporal` | Must match ActorSHAP's `--mask_axis`             |
-| `--latent_dim`         | `128`      | Latent space dimension                           |
-
-
-### `evaluate_shap_synthetic.py gaussian`
-
-
-| Argument                 | Default      | Description                                                         |
-| ------------------------ | ------------ | ------------------------------------------------------------------- |
-| `--ckpt_dir`             | *(required)* | ActorSHAP output directory                                          |
-| `--lstm_vae_ckpt_dir`    | `None`       | LstmVAE output directory (usually same as `--ckpt_dir`)             |
-| `--K_mc_true`            | `1000`       | MC samples for ground-truth Shapley values (higher = more accurate) |
-| `--n_completion_samples` | `50`         | Stochastic completions per coalition                                |
-| `--n_test_sequences`     | `100`        | Number of test sequences to evaluate                                |
-| `--device`               | `cuda:0`     | Evaluation device                                                   |
-| `--use_gaussian_full`    | `False`      | Also run expensive LedoitWolf full-covariance baseline              |
-
-
-### `evaluate_shap_synthetic.py diagnostic`
-
-
-| Argument                 | Default      | Description                             |
-| ------------------------ | ------------ | --------------------------------------- |
-| `--ckpt_dir`             | *(required)* | ActorSHAP output directory              |
-| `--lstm_vae_ckpt_dir`    | `None`       | LstmVAE output directory                |
-| `--n_kernel_samples`     | `200`        | KernelSHAP coalition pairs per sequence |
-| `--n_completion_samples` | `50`         | Stochastic completions per coalition    |
-
+Ranking-based metrics (Spearman ρ, Top-1, Insertion AUC, Deletion AUC) for
+the same methods plus OTFlow-SHAP are produced by
+`scripts/compute_ranking_metrics.py`, which consumes the
+`per_sequence.json` emitted by stage 5.
 
 ---
 
 ## Metrics
 
-### Gaussian benchmark
+| Metric  | Formula                          | Direction |
+|---------|----------------------------------|-----------|
+| **EC1** | `mean_i \|φ_true − φ_method\|`   | lower     |
+| **EC2** | `mean_S (v_true(S) − v̂(S))²`    | lower     |
+| **EC3** | `mean_S (f(x*) − v̂(S))²`        | lower     |
 
-
-| Metric  | Formula                     | Interpretation                                      |
-| ------- | --------------------------- | --------------------------------------------------- |
-| **EC1** | `mean                       | φ_true − φ_method                                   |
-| **EC2** | `mean (v_true(S) − v̂(S))²` | MSE of contribution functions — **lower is better** |
-| **EC3** | `mean (f(x*) − v̂(S))²`     | Expected Prediction Error — **lower is better**     |
-
-
-### Diagnostic benchmark
-
-
-| Metric             | Interpretation                                                          |
-| ------------------ | ----------------------------------------------------------------------- |
-| **EC1**            | MAE of per-joint Shapley values — lower is better                       |
-| **Top-k recovery** | Fraction of true top-k joints in estimated top-k — **higher is better** |
-| **Spearman ρ**     | Rank correlation of Shapley values — **higher is better**               |
-
+For the spatial mode the coalition space is sampled (paired KernelSHAP),
+so EC2/EC3 are estimated over those sampled coalitions.
 
 ---
 
-## Notes
+## Adding a new benchmark
 
-- All three steps use the **same random seed and data split** when
-`--actor_data_dir` is passed to `train_lstm_vae_synthetic.py`. This ensures
-both models are trained and evaluated on identical data.
-- Re-running a training script **overwrites** the previous run in the same
-output directory. Rename or copy the directory first if you want to keep
-previous results.
-- EC1/EC2/EC3 compare all methods against the **same black-box MLP**. The MLP's
-accuracy vs the true label function does not affect the relative ranking of
-methods — only imputation quality matters.
-
+See [`docs/CONTRIBUTING-DATASETS.md`](../docs/CONTRIBUTING-DATASETS.md).

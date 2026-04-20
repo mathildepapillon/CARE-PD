@@ -1,0 +1,14 @@
+{
+  "source_cache": "/home/papillon/code/CARE-PD/cache/flow_matching/BMCLab_h36m_80_fold1/cache.npz",
+  "dataset": "BMCLab",
+  "data_type": "h36m",
+  "num_folds": 23,
+  "fold": 1,
+  "seq_len": 80,
+  "clip_stride": 80,
+  "eval_subjects": [
+    "SUB01"
+  ],
+  "num_eval_clips": 369,
+  "stats_reused_from_source": true
+}

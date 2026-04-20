@@ -67,7 +67,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--F", type=int, default=3)
     p.add_argument("--T", type=int, default=81)
     p.add_argument("--K", type=int, default=4,
-                   help="Number of temporal windows (coalitions = 2^K).")
+                   help="Number of temporal windows (must be a multiple of 4; "
+                        "coalitions = 2^K).")
+    p.add_argument("--players", choices=("temporal", "spatial"), default="temporal",
+                   help="SHAP player mode: 'temporal' = K windows as players, "
+                        "'spatial' = J joints as players.")
+    p.add_argument("--signal_joints", type=int, nargs=4, default=None,
+                   metavar=("J0", "J1", "J2", "J3"),
+                   help="Only used when --players=spatial: indices of the 4 "
+                        "joints that drive the label (default: 0 1 2 3).")
     p.add_argument("--n_train", type=int, default=2000)
     p.add_argument("--n_val",   type=int, default=500)
     p.add_argument("--n_test",  type=int, default=100)
@@ -91,14 +99,25 @@ def main() -> None:
         J=args.J, F=args.F, T=args.T, K=args.K,
         n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
         clf_epochs=args.clf_epochs, seed=args.seed, device=device,
+        player_mode=args.players,
+        signal_joints=tuple(args.signal_joints) if args.signal_joints is not None else None,
     )
 
     # ---- Save benchmark + classifier ---------------------------------------
     bench.save(str(out_dir / "synthetic_benchmark.pkl"))
     torch.save(clf.state_dict(), str(out_dir / "synthetic_clf.pt"))
-    clf_meta = {"type": "SyntheticMLPClassifier",
-                "J": args.J, "F": args.F, "T": args.T, "K": args.K,
-                "num_classes": 3}
+    clf_meta = {
+        "type":        "SyntheticMLPClassifier",
+        "J":           args.J,
+        "F":           args.F,
+        "T":           args.T,
+        "K":           args.K,
+        "num_classes": 3,
+        "player_mode": args.players,
+        "signal_joints": (
+            list(bench.signal_joints) if bench.signal_joints is not None else None
+        ),
+    }
     with open(out_dir / "synthetic_clf_meta.json", "w") as f:
         json.dump(clf_meta, f, indent=2)
 
@@ -116,12 +135,20 @@ def main() -> None:
 
     # ---- Save config --------------------------------------------------------
     cfg = {
-        "data_mode": "synthetic_gaussian",
-        "J": args.J, "F": args.F, "T": args.T, "K": args.K,
-        "rho": args.rho, "alpha": args.alpha,
-        "n_train": args.n_train, "n_val": args.n_val, "n_test": args.n_test,
-        "clf_epochs": args.clf_epochs,
-        "seed": args.seed,
+        "data_mode":     "synthetic_gaussian",
+        "J":             args.J,
+        "F":             args.F,
+        "T":             args.T,
+        "K":             args.K,
+        "rho":           args.rho,
+        "alpha":         args.alpha,
+        "n_train":       args.n_train,
+        "n_val":         args.n_val,
+        "n_test":        args.n_test,
+        "clf_epochs":    args.clf_epochs,
+        "seed":          args.seed,
+        "player_mode":   args.players,
+        "signal_joints": clf_meta["signal_joints"],
     }
     with open(out_dir / "config.json", "w") as f:
         json.dump(cfg, f, indent=2)

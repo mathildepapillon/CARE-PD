@@ -1,0 +1,15 @@
+{
+  "source_ckpt_dir": "/home/papillon/code/CARE-PD/experiment_outs/actor_shap_synthetic/cpu_diag/actor_shap_synthetic_synthetic_diagnostic",
+  "data_mode": "synthetic_diagnostic",
+  "n_train_clips": 504,
+  "n_val_clips": 56,
+  "seq_len": 81,
+  "n_joints": 17,
+  "n_feats": 3,
+  "val_frac": 0.1,
+  "seed": 42,
+  "train_abs_mean_max": 0.0011557443892809922,
+  "train_std_max": 0.15164097339620053,
+  "cache_path": "/home/papillon/code/CARE-PD/cache/flow_matching/synthetic_diagnostic/cache.npz",
+  "sanity_path": "/home/papillon/code/CARE-PD/cache/flow_matching/synthetic_diagnostic/sanity.npz"
+}

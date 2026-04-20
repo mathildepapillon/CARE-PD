@@ -210,6 +210,110 @@ class FlowImputer:
         return [actor[i : i + 1] for i in range(n_samples)]
 
     # ------------------------------------------------------------------
+    # Batched API — run many coalitions through a single ODE
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def sample_completions_batched(
+        self,
+        x: Tensor,                              # (1, J, F, T)
+        mask: Tensor,                           # (1, T) pad mask
+        coalition_masks: Tensor,                # (B, J) spatial
+        n_samples: int = 20,
+    ) -> Tensor:
+        """Batched version of :meth:`sample_completions`.
+
+        Given ``B`` spatial coalitions packed into ``coalition_masks`` of
+        shape ``(B, J)`` (``True`` = observed), run a *single* ODE with an
+        effective batch of ``B * n_samples`` samples and return completions
+        in classifier layout ``(B, n_samples, J, F, T)``.
+
+        Per-sequence callers (faithfulness metric computation) typically
+        need tens-to-hundreds of coalitions per evaluation. Batching them
+        through one ODE amortises the ``num_steps`` forward passes across
+        all coalitions at once which is dramatically faster than issuing
+        ``B`` independent ODE calls, at the cost of a larger per-step batch
+        (which modern transformer attention handles efficiently).
+
+        ``coalition_masks`` must be 2-D ``(B, J)``; temporal coalitions are
+        not supported by the batched path (and spatial is what every
+        KernelSHAP driver in this repo produces).
+        """
+        if x.dim() != 4 or x.shape[0] != 1:
+            raise ValueError(
+                f"FlowImputer expects (1, J, F, T); got {tuple(x.shape)}"
+            )
+        if coalition_masks.dim() != 2:
+            raise ValueError(
+                f"coalition_masks must be (B, J); got {tuple(coalition_masks.shape)}"
+            )
+        _, J, F, T = x.shape
+        B, Jc = coalition_masks.shape
+        if Jc != J:
+            raise ValueError(
+                f"coalition_masks J dim {Jc} != x J dim {J}"
+            )
+        device = self._device
+        x = x.to(device)
+        pad = mask.to(device).bool()
+        cm = coalition_masks.to(device).bool()
+
+        # Classifier -> flow layout.
+        x1 = x.permute(0, 3, 1, 2).contiguous()                    # (1, T, J, C)
+        if self._stats_mean is not None and self._stats_std is not None:
+            x1 = (x1 - self._stats_mean) / self._stats_std
+
+        BN = B * n_samples
+        # Target sample x1_n: same x1 replicated BN times.
+        x1_n = x1.expand(BN, -1, -1, -1).contiguous()              # (BN, T, J, C)
+
+        # obs_mask: (B, J) -> (B, 1, T, J, 1) -> (B, n_samples, T, J, C) -> (BN, T, J, C)
+        obs_mask = (
+            cm.view(B, 1, 1, J, 1)
+              .expand(B, n_samples, T, J, F)
+              .reshape(BN, T, J, F)
+              .contiguous()
+        )
+
+        x0 = torch.randn(BN, T, J, F, device=device, dtype=x1_n.dtype)
+
+        pad_for_net = pad.expand(BN, -1).contiguous() if pad.shape[0] == 1 else pad
+
+        K = self._num_steps
+        dt = 1.0 / K
+
+        def v_fn(xk: Tensor, t: float) -> Tensor:
+            t_batch = torch.full((BN,), t, device=device, dtype=xk.dtype)
+            return self._model(xk, t_batch, mask=pad_for_net)      # (BN, T, J, C)
+
+        def harmonize(xk: Tensor, t: float) -> Tensor:
+            cond_path = (1.0 - t) * x0 + t * x1_n
+            return torch.where(obs_mask, cond_path, xk)
+
+        x_k = x0.clone()
+        for k in range(K):
+            t_k = k * dt
+            t_mid = t_k + 0.5 * dt
+            t_next = (k + 1) * dt
+            if self._solver == "euler":
+                v1 = v_fn(x_k, t_k)
+                x_next = x_k + dt * v1
+            else:
+                v1 = v_fn(x_k, t_k)
+                x_mid = x_k + 0.5 * dt * v1
+                x_mid = harmonize(x_mid, t_mid)
+                v2 = v_fn(x_mid, t_mid)
+                x_next = x_k + dt * v2
+            x_k = harmonize(x_next, t_next)
+
+        if self._stats_mean is not None and self._stats_std is not None:
+            x_k = x_k * self._stats_std + self._stats_mean
+
+        # (BN, T, J, C) -> (BN, J, C, T) -> (B, n_samples, J, F, T)
+        actor = x_k.permute(0, 2, 3, 1).contiguous()               # (BN, J, F, T)
+        return actor.view(B, n_samples, J, F, T)
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 

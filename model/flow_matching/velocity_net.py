@@ -99,6 +99,34 @@ class FramePositionalEncoding(nn.Module):
         return self.pe[:T]
 
 
+class JointPositionalEncoding(nn.Module):
+    """Learned per-joint embedding, shape ``(J, d_model)``.
+
+    Used only in ``tokenization='joint'`` mode: adds a joint-identity signal on
+    top of the frame positional encoding so the transformer can tell which of
+    the ``T*J`` tokens corresponds to which skeletal joint.
+
+    A learned lookup is used rather than a sinusoid because J is small (17)
+    and joint indices have no natural ordinal distance — pelvis and
+    left-wrist are not "closer" than pelvis and right-wrist in any metric
+    sense.
+    """
+
+    def __init__(self, d_model: int, n_joints: int):
+        super().__init__()
+        self.embedding = nn.Embedding(n_joints, d_model)
+        nn.init.trunc_normal_(self.embedding.weight, std=0.02)
+        self.n_joints = n_joints
+
+    def forward(self, J: int) -> torch.Tensor:
+        if J != self.n_joints:
+            raise ValueError(
+                f"JointPositionalEncoding built for {self.n_joints} joints, got J={J}"
+            )
+        idx = torch.arange(J, device=self.embedding.weight.device)
+        return self.embedding(idx)  # (J, d_model)
+
+
 class FlowTimeMLP(nn.Module):
     """Linear -> SiLU -> Linear on the sinusoidal time embedding.
 
@@ -164,12 +192,18 @@ class VelocityNet(nn.Module):
         time_emb_dim: int = 128,
         max_len: int = 512,
         activation: str = "gelu",
+        tokenization: str = "frame",
     ) -> None:
         super().__init__()
+        if tokenization not in ("frame", "joint"):
+            raise ValueError(
+                f"tokenization must be 'frame' or 'joint', got {tokenization!r}"
+            )
         self.n_joints = n_joints
         self.n_coords = n_coords
         self.d_model = d_model
         self.time_emb_dim = time_emb_dim
+        self.tokenization = tokenization
         input_dim = n_joints * n_coords  # e.g. 51
 
         # Flow-time embedding (continuous t in [0, 1])
@@ -177,8 +211,20 @@ class VelocityNet(nn.Module):
             sinusoid_dim=time_emb_dim, out_dim=time_emb_dim
         )
 
-        # Per-frame input projection: concat(pose_flat, t_tok) -> d_model
-        self.in_proj = nn.Linear(input_dim + time_emb_dim, d_model)
+        # Input/output projections differ by tokenisation mode:
+        #
+        #  frame-tok : each token is a whole frame ⇒ per-token feature dim is
+        #              ``J*C + time_emb``. Readout back to ``J*C``.
+        #  joint-tok : each token is one joint at one frame ⇒ per-token feature
+        #              dim is ``C + time_emb``. Readout back to ``C``.
+        if tokenization == "frame":
+            self.in_proj = nn.Linear(input_dim + time_emb_dim, d_model)
+            self.out_proj = nn.Linear(d_model, input_dim)
+            self.joint_pos = None
+        else:  # "joint"
+            self.in_proj = nn.Linear(n_coords + time_emb_dim, d_model)
+            self.out_proj = nn.Linear(d_model, n_coords)
+            self.joint_pos = JointPositionalEncoding(d_model, n_joints=n_joints)
 
         # Frame positional encoding (added to token embeddings)
         self.frame_pos = FramePositionalEncoding(d_model, max_len=max_len)
@@ -194,9 +240,6 @@ class VelocityNet(nn.Module):
             norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-
-        # Readout: d_model -> n_joints * n_coords, then reshape
-        self.out_proj = nn.Linear(d_model, input_dim)
 
         self._reset_parameters()
 
@@ -244,25 +287,60 @@ class VelocityNet(nn.Module):
         if t.dim() != 1 or t.shape[0] != B:
             raise ValueError(f"t must be (B,), got {tuple(t.shape)}")
 
-        x_flat = x_t.reshape(B, T, J * C)                       # (B, T, 51)
         t_emb = self.flow_time_mlp(t)                           # (B, time_emb_dim)
-        t_tok = t_emb.unsqueeze(1).expand(B, T, self.time_emb_dim)  # (B, T, 128)
-        tok = torch.cat([x_flat, t_tok], dim=-1)                # (B, T, 51+128)
-        tok = self.in_proj(tok)                                 # (B, T, d_model)
-        tok = tok + self.frame_pos(T).to(tok.dtype)             # add frame pos
+
+        if self.tokenization == "frame":
+            # N = T tokens, each carrying a flattened (J*C) pose + time embed.
+            x_flat = x_t.reshape(B, T, J * C)                       # (B, T, 51)
+            t_tok = t_emb.unsqueeze(1).expand(B, T, self.time_emb_dim)
+            tok = torch.cat([x_flat, t_tok], dim=-1)                # (B, T, 51+time_emb)
+            tok = self.in_proj(tok)                                 # (B, T, d_model)
+            tok = tok + self.frame_pos(T).to(tok.dtype)             # add frame pos
+
+            if mask is None:
+                src_key_padding_mask = None
+            else:
+                if mask.shape != (B, T):
+                    raise ValueError(
+                        f"mask must be (B, T) = ({B}, {T}), got {tuple(mask.shape)}"
+                    )
+                src_key_padding_mask = ~mask
+
+            h = self.encoder(tok, src_key_padding_mask=src_key_padding_mask)
+            v_flat = self.out_proj(h)                                       # (B, T, 51)
+            return v_flat.reshape(B, T, J, C)
+
+        # ------------------------------------------------------------------
+        # Joint-level tokenisation: N = T * J tokens, each one scalar joint.
+        # ------------------------------------------------------------------
+        N = T * J
+        x_joint = x_t.reshape(B, N, C)                              # (B, T*J, C)
+        t_tok = t_emb.unsqueeze(1).expand(B, N, self.time_emb_dim)  # (B, T*J, time_emb)
+        tok = torch.cat([x_joint, t_tok], dim=-1)                   # (B, T*J, C+time_emb)
+        tok = self.in_proj(tok)                                     # (B, T*J, d_model)
+
+        # Additive positional encoding: sum of frame PE (broadcast over J) and
+        # joint PE (broadcast over T). This is the standard 2D-factorised PE
+        # pattern used when flattening a 2D grid into a 1D token stream.
+        frame_pe = self.frame_pos(T).to(tok.dtype)                  # (T, d_model)
+        joint_pe = self.joint_pos(J).to(tok.dtype)                  # (J, d_model)
+        pe = (frame_pe.unsqueeze(1) + joint_pe.unsqueeze(0)).reshape(N, self.d_model)
+        tok = tok + pe
 
         if mask is None:
             src_key_padding_mask = None
         else:
             if mask.shape != (B, T):
-                raise ValueError(f"mask must be (B, T) = ({B}, {T}), got {tuple(mask.shape)}")
-            # nn.Transformer expects True at positions that should be IGNORED.
-            src_key_padding_mask = ~mask
+                raise ValueError(
+                    f"mask must be (B, T) = ({B}, {T}), got {tuple(mask.shape)}"
+                )
+            # Expand per-frame padding to per-(frame, joint): a padded frame
+            # means every one of its J joints is padded too.
+            src_key_padding_mask = (~mask).unsqueeze(-1).expand(B, T, J).reshape(B, N)
 
-        h = self.encoder(tok, src_key_padding_mask=src_key_padding_mask)  # (B, T, d_model)
-        v_flat = self.out_proj(h)                                           # (B, T, 51)
-        v = v_flat.reshape(B, T, J, C)
-        return v
+        h = self.encoder(tok, src_key_padding_mask=src_key_padding_mask)
+        v_joint = self.out_proj(h)                                   # (B, T*J, C)
+        return v_joint.reshape(B, T, J, C)
 
     @torch.no_grad()
     def count_parameters(self) -> int:

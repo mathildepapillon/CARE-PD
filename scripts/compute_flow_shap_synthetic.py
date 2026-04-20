@@ -78,6 +78,7 @@ def _load_velocity_net(flow_cfg: dict, ckpt_path: Path, device: torch.device) ->
         dropout=float(flow_cfg.get("dropout", 0.0)),
         time_emb_dim=int(flow_cfg["time_emb_dim"]),
         max_len=max(int(flow_cfg["seq_len"]) + 16, 256),
+        tokenization=str(flow_cfg.get("tokenization", "frame")),
     ).to(device)
     ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
     raw_state = ckpt.get("state_dict", ckpt)
@@ -113,6 +114,7 @@ def _load_gaussian_classifier(ckpt_dir: Path, device: torch.device) -> nn.Module
     clf = SyntheticMLPClassifier(
         J=meta["J"], F=meta["F"], T=meta["T"],
         K=meta.get("K", 4), num_classes=meta["num_classes"],
+        player_mode=meta.get("player_mode", "temporal"),
     )
     clf.load_state_dict(torch.load(str(ckpt_dir / "synthetic_clf.pt"),
                                    map_location="cpu", weights_only=False))

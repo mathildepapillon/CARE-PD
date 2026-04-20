@@ -1,16 +1,21 @@
-"""synthetic — Synthetic benchmark datasets for ActorSHAP validation.
+"""synthetic — controlled-ground-truth benchmarks for SHAP imputation.
 
-Two benchmarks are provided:
+Contents
+--------
 
 gaussian_motion
-    Temporal motion drawn from a known Gaussian distribution
-    (equicorrelation × AR(1) covariance). True conditional distributions are
-    analytically Gaussian, enabling exact v_true(S) computation for EC1/EC2/EC3
-    comparison (Olsen et al. JMLR 2022, Section 4.2 analogue).
+    Temporal-or-spatial motion drawn from a Gaussian with equicorrelation
+    across joints and AR(1) across time. Analytically-tractable conditional
+    distribution lets us compute ground-truth Shapley values (exact by 2^K
+    enumeration in temporal mode; KernelSHAP with the oracle Gaussian
+    conditional in spatial mode). This is the benchmark the flow-matching /
+    VAEAC / OTFlow-SHAP evaluations in this repo target.
 
-diagnostic_motion
-    Fourier-series synthetic gait with a known subset of diagnostic joints
-    that carry label-relevant amplitude signal.  The black-box classifier is a
-    linear function of joint velocities with analytically exact true Shapley
-    values — enabling top-k joint recovery comparisons.
+Adding a new synthetic benchmark
+--------------------------------
+
+See ``docs/CONTRIBUTING-DATASETS.md`` for a step-by-step walkthrough of the
+interface a new benchmark must implement (sampling, conditional sampling,
+label function, oracle Shapley, classifier) and where it plugs into the
+build / flow-cache / EC-evaluation pipeline.
 """

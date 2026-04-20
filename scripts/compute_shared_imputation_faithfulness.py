@@ -73,6 +73,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# NOTE: eagerly import the PyPI ``flow_matching`` package before anything in
+# ``model.potr.*`` is imported. Several POTR modules call
+# ``sys.path.insert(0, thispath + "/../")``, which exposes our local
+# ``model/flow_matching/`` directory at the top-level import root and
+# shadows the installed Meta ``flow_matching`` package (which has the
+# ``solver`` submodule we need). Caching the real package in
+# ``sys.modules`` here prevents that collision when ``FlowImputer`` is
+# lazily imported later.
+import flow_matching  # noqa: E402,F401
+import flow_matching.solver  # noqa: E402,F401
+
 from data.dataloaders import collate_fn  # noqa: E402
 from model.actor.cvae_data import actor_batch_from_carepd, get_carepd_datasets  # noqa: E402
 from model.actor.shap_eval_shared import (  # noqa: E402

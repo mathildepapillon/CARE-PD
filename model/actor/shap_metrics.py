@@ -826,21 +826,36 @@ def compute_spatial_faithfulness_batched(
     elif method == "flow_imputer":
         if flow_imputer is None:
             raise ValueError("flow_imputer is required for method='flow_imputer'")
-        all_completions: list[torch.Tensor] = []
-        slice_ends: list[int] = []
-        for i in range(N):
-            comps = flow_imputer.sample_completions(
-                x, y, mask, lengths, cms_t[i : i + 1], n_samples=n_samples,
+        # Fast path: batch all N coalitions through a single ODE of effective
+        # size N*n_samples. Falls back to the serial loop if the batched API
+        # is unavailable (e.g. older FlowImputer without sample_completions_batched).
+        if hasattr(flow_imputer, "sample_completions_batched"):
+            # cms_t is (N, J) spatial.
+            completions = flow_imputer.sample_completions_batched(
+                x, mask, cms_t, n_samples=n_samples,
+            )  # (N, n_samples, J, F, T)
+            Nc, S, Jc, Fc, Tc = completions.shape
+            flat = completions.reshape(Nc * S, Jc, Fc, Tc)
+            probs_flat = _classify_chunked(
+                classifier_fn, flat, class_idx, chunk_size=chunk_size,
+            )  # (N*S,)
+            all_probs = probs_flat.reshape(Nc, S).mean(axis=1)
+        else:
+            all_completions: list[torch.Tensor] = []
+            slice_ends: list[int] = []
+            for i in range(N):
+                comps = flow_imputer.sample_completions(
+                    x, y, mask, lengths, cms_t[i : i + 1], n_samples=n_samples,
+                )
+                all_completions.extend(comps)
+                slice_ends.append(len(all_completions))
+            all_comp_probs = _batch_classify(
+                classifier_fn, all_completions, class_idx, chunk_size=chunk_size,
             )
-            all_completions.extend(comps)
-            slice_ends.append(len(all_completions))
-        all_comp_probs = _batch_classify(
-            classifier_fn, all_completions, class_idx, chunk_size=chunk_size,
-        )
-        starts = [0] + slice_ends[:-1]
-        all_probs = np.array([
-            all_comp_probs[s:e].mean() for s, e in zip(starts, slice_ends)
-        ])
+            starts = [0] + slice_ends[:-1]
+            all_probs = np.array([
+                all_comp_probs[s:e].mean() for s, e in zip(starts, slice_ends)
+            ])
 
     elif method == "physics":
         if physics_completer is None:

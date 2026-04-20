@@ -1,0 +1,60 @@
+{
+  "dataset": "synthetic_gaussian",
+  "data_type": "synthetic",
+  "num_folds": 1,
+  "fold": 0,
+
+  "cache_dir": "cache/flow_matching/synthetic_gaussian",
+  "seq_len": 81,
+  "clip_stride_train": 81,
+  "clip_stride_val": 81,
+
+  "mirror_augment": false,
+  "mirror_axis": 0,
+
+  "batch_size": 128,
+  "num_workers": 2,
+
+  "d_model": 192,
+  "nhead": 6,
+  "num_layers": 4,
+  "ff_dim": 768,
+  "dropout": 0.1,
+  "d_latent": 64,
+
+  "decoder_head":     "gaussian_ivanov",
+  "ivanov_min_sigma": 0.01,
+  "use_prior_memory": true,
+  "prior_reg_sigma_mu":    1e4,
+  "prior_reg_sigma_sigma": 1e-4,
+
+  "mask_mode": "benchmark",
+  "bench_path": null,
+
+  "mask_p_temporal": 0.40,
+  "mask_p_spatial":  0.40,
+  "mask_p_element":  0.20,
+
+  "kl_anneal_start_epoch": 0,
+  "kl_anneal_end_epoch":   40,
+  "kl_weight_final":       1.0,
+
+  "free_bits": 0.05,
+
+  "lr": 2e-4,
+  "weight_decay": 0.0,
+  "warmup_steps": 150,
+  "max_epochs": 400,
+  "grad_clip": 1.0,
+  "ema_decay": 0.999,
+
+  "precision": "32-true",
+  "devices": 1,
+  "accelerator": "gpu",
+
+  "wandb_project": null,
+  "checkpoint_dir": "experiment_outs/vaeac_synthetic/synthetic_gaussian",
+  "seed": 42,
+
+  "_comment": "Default config is the faithful Olsen/Ivanov replication: per-feature heteroscedastic Gaussian output head (GaussianIvanovHead, min_sigma=1e-2, matches prob_utils.GaussianLoss in tigvarts/vaeac) plus prior->decoder MemoryLayer-style skip connections and the Ivanov latent-prior regulariser with (sigma_mu=1e4, sigma_sigma=1e-4). To run the legacy scalar-sigma baseline for ablation, set decoder_head='gaussian_scalar' and use_prior_memory=false. Total params at d_model=192, num_layers=4, ff_dim=768 with the Olsen config is ~5.76 M (vs 4.96 M for VelocityNet). mask_mode='benchmark' samples coalitions matched to the EC evaluator: uniform over {0,1}^K windows for temporal benchmarks, uniform over {0,1}^J joints for spatial."
+}

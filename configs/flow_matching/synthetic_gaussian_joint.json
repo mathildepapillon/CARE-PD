@@ -1,0 +1,47 @@
+{
+  "dataset": "synthetic_gaussian",
+  "data_type": "synthetic",
+  "num_folds": 1,
+  "fold": 0,
+
+  "cache_dir": "cache/flow_matching/synthetic_gaussian",
+  "seq_len": 81,
+  "clip_stride_train": 81,
+  "clip_stride_val": 81,
+
+  "mirror_augment": false,
+  "mirror_axis": 0,
+
+  "batch_size": 32,
+  "num_workers": 2,
+
+  "d_model": 256,
+  "nhead": 8,
+  "num_layers": 6,
+  "ff_dim": 1024,
+  "dropout": 0.1,
+  "time_emb_dim": 256,
+
+  "tokenization": "joint",
+
+  "lr": 2e-4,
+  "weight_decay": 0.0,
+  "warmup_steps": 300,
+  "max_epochs": 100,
+  "grad_clip": 1.0,
+  "ema_decay": 0.999,
+
+  "precision": "32-true",
+  "devices": 1,
+  "accelerator": "gpu",
+
+  "val_sample_every_n_epochs": 0,
+  "val_sample_steps": 50,
+  "val_sample_n": 4,
+
+  "wandb_project": null,
+  "checkpoint_dir": "experiment_outs/flow_matching_synthetic/synthetic_gaussian_joint",
+  "seed": 42,
+
+  "_comment": "Joint-level tokenization variant of the flow-matching baseline. VelocityNet emits one token per (frame, joint) pair (T*J = 81*17 = 1377 tokens) instead of one token per frame (T = 81). The transformer body (d_model=256, nhead=8, num_layers=6, ff_dim=1024) is identical to the frame-tokenised config so parameter counts are nearly identical, allowing a clean architectural ablation. batch_size is dropped from 128 to 32 to keep attention memory in check (1377**2 is ~290x more than 81**2). Per-joint learned positional embedding is added on top of the sinusoidal frame PE."
+}

@@ -1,7 +1,8 @@
-"""gaussian_motion.py — Gaussian temporal motion benchmark for ActorSHAP validation.
+"""gaussian_motion.py — Gaussian motion benchmark for flow-SHAP validation.
 
 Mirrors Olsen et al. JMLR 2022 Section 4.2 (Simulation Study: Continuous Data)
-adapted for temporal motion sequences.
+adapted for temporal motion sequences, and extended with a spatial-players
+variant where the J joints themselves are the SHAP players.
 
 DATA MODEL
 ----------
@@ -13,8 +14,17 @@ DATA MODEL
 
 PLAYERS
 -------
-Temporal: M = K = 4 equal-length windows, exactly 2^4 = 16 coalitions → exact
-Shapley values tractable without approximation.
+Temporal: M = K equal-length windows, K must be a multiple of 4 so the
+Olsen-style interaction label can be tiled cleanly.  2^K coalitions → exact
+Shapley tractable by enumeration when K is small (K <= 12 or so); for K == 4
+this reduces to Olsen et al. (2022) Eq. (12).
+
+Spatial:  M = J joints (typically 17).  Coalition space 2^17 is too large for
+enumeration so ground-truth Shapley is estimated via KernelSHAP with the
+exact joint-conditional Gaussian as imputer (same oracle used for "true" in
+the temporal case).  Label depends on 4 designated "signal" joints via an
+Olsen-style term; the remaining joints are nuisance (uncorrelated with label
+except indirectly via joint equi-correlation).
 
 TRUE CONDITIONAL (key simplification via Kronecker structure)
 --------------------------------------------------------------
@@ -63,7 +73,7 @@ import itertools
 import pickle
 from math import comb
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal, Sequence
 
 import numpy as np
 import torch
@@ -71,6 +81,8 @@ import torch.nn as nn
 import torch.optim as optim
 from scipy.special import ndtr as _ndtr  # standard normal CDF Φ
 from torch.utils.data import DataLoader, TensorDataset
+
+PlayerMode = Literal["temporal", "spatial"]
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +108,54 @@ def _shapley_kernel_weight(s: int, M: int) -> float:
 
 def _enumerate_temporal_coalitions(K: int = 4):
     """Return all 2^K (K,)-binary rows and their kernel weights."""
+    if K > 20:
+        raise ValueError(
+            f"K={K} would enumerate 2^{K} = {2**K} coalitions; refusing. "
+            "Use KernelSHAP sampling instead."
+        )
     coalitions = np.array(list(itertools.product([0, 1], repeat=K)), dtype=int)
     weights = np.array([_shapley_kernel_weight(int(c.sum()), K) for c in coalitions])
+    return coalitions, weights
+
+
+def _sample_kernelshap_coalitions(
+    M: int,
+    n_pairs: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample ``2 * n_pairs`` KernelSHAP coalitions with their kernel weights.
+
+    Paired sampling (Covert & Lee 2021) draws a subset size s from the
+    SHAP kernel size-distribution and emits BOTH z and its complement to
+    halve variance.  Boundary coalitions (empty and full) are emitted
+    separately by the caller (they carry constraints, not regression
+    weights).
+
+    Returns
+    -------
+    coalitions : (2*n_pairs, M) binary array
+    weights    : (2*n_pairs,) SHAP kernel weights (all non-zero by
+                 construction since 0 < s < M)
+    """
+    sizes = np.arange(1, M)                       # valid coalition sizes
+    size_weights = np.array([
+        _shapley_kernel_weight(int(s), M) * comb(M, int(s))
+        for s in sizes
+    ], dtype=np.float64)
+    p = size_weights / size_weights.sum()
+
+    coalitions = np.zeros((2 * n_pairs, M), dtype=int)
+    weights = np.zeros(2 * n_pairs, dtype=np.float64)
+    for i in range(n_pairs):
+        s = int(rng.choice(sizes, p=p))
+        idx = rng.choice(M, size=s, replace=False)
+        z = np.zeros(M, dtype=int)
+        z[idx] = 1
+        coalitions[2 * i]     = z
+        coalitions[2 * i + 1] = 1 - z
+        w = _shapley_kernel_weight(int(z.sum()), M)
+        weights[2 * i]     = w
+        weights[2 * i + 1] = _shapley_kernel_weight(int((1 - z).sum()), M)
     return coalitions, weights
 
 
@@ -152,41 +210,107 @@ def _per_window_grand_means(
     )
 
 
+def _olsen_term(
+    u: np.ndarray,
+    feat_idx: Sequence[int],
+    coeffs: Sequence[float],
+) -> np.ndarray:
+    """One Olsen-style interaction term across 4 feature indices.
+
+    Given standardised uniform features ``u`` (shape (N, P)) and four feature
+    indices ``(a, b, c, d)``, returns::
+
+        c1 · sin(π · u_a · u_b) + c2 · u_c · exp(c3 · u_c · u_d)
+
+    All four features appear in the output so each one has a well-defined
+    Shapley contribution (neither the sin term nor the exp term factorises
+    across its pair, guaranteeing a non-trivial interaction effect).
+    """
+    a, b, c, d = feat_idx
+    c1, c2, c3 = coeffs
+    return (
+        c1 * np.sin(np.pi * u[:, a] * u[:, b])
+        + c2 * u[:, c] * np.exp(c3 * u[:, c] * u[:, d])
+    )
+
+
 def nonlinear_olsen_score(
     x: np.ndarray,
     window_assignments: list[list[int]],
     sigma_k: np.ndarray,
     coeffs: np.ndarray,
 ) -> np.ndarray:
-    """Nonlinear response adapted from Olsen et al. (JMLR 2022) Eq. (12), K=4 windows.
+    """Nonlinear response adapted from Olsen et al. (JMLR 2022) Eq. (12).
 
-    Maps sequences (N, J, F, T) → scalar score (N,) via:
+    Generalised to arbitrary K divisible by 4 by tiling the base Olsen term
+    over consecutive groups of 4 windows.  For K=4 this reduces exactly to
 
-        w_k  = mean of all (j, f, t) in window k          (per-window grand mean)
-        u_k  = Φ(w_k / σ_k)                               (CDF → approx. Uniform[0,1])
-        score = c₁·sin(π·u₀·u₁) + c₂·u₂·exp(c₃·u₂·u₃)  (nonlinear + interactions)
+        score = c1·sin(π·u0·u1) + c2·u2·exp(c3·u2·u3)
 
-    Windows 0&1 interact in the sin term; windows 2&3 interact in the exp term.
-    All four windows influence the score, with different structural roles.
+    (one term, three coefficients).  For K=8 we add a second term over
+    windows 4..7, and so on.
 
     Parameters
     ----------
     x : (N, J, F, T)
-    window_assignments : K=4 lists of frame indices (from GaussianMotionBenchmark)
-    sigma_k : (K,) per-window standard deviations for standardisation
-    coeffs  : (3,) = [c1, c2, c3]
+    window_assignments : K lists of frame indices.
+    sigma_k : (K,) per-window standard deviations for standardisation.
+    coeffs  : (n_terms, 3) coefficient matrix where ``n_terms = K // 4``.
 
     Returns
     -------
     score : (N,) float64
     """
-    w = _per_window_grand_means(x, window_assignments)  # (N, K)
-    u = _ndtr(w / (sigma_k[np.newaxis] + 1e-12))        # (N, K), ≈ Uniform[0,1]
-    c1, c2, c3 = coeffs
-    return (
-        c1 * np.sin(np.pi * u[:, 0] * u[:, 1])
-        + c2 * u[:, 2] * np.exp(c3 * u[:, 2] * u[:, 3])
-    )
+    w = _per_window_grand_means(x, window_assignments)        # (N, K)
+    u = _ndtr(w / (sigma_k[np.newaxis] + 1e-12))              # (N, K)
+    coeffs = np.asarray(coeffs, dtype=np.float64)
+    if coeffs.ndim == 1:
+        # Back-compat: a flat (3,) vector means a single Olsen term.
+        coeffs = coeffs.reshape(1, 3)
+    K = u.shape[1]
+    n_terms = coeffs.shape[0]
+    if K != 4 * n_terms:
+        raise ValueError(
+            f"K={K} must equal 4 * n_terms={4 * n_terms} (coeffs has "
+            f"{n_terms} rows)."
+        )
+    score = np.zeros(u.shape[0], dtype=np.float64)
+    for t_idx in range(n_terms):
+        offset = 4 * t_idx
+        score += _olsen_term(u, (offset, offset + 1, offset + 2, offset + 3), coeffs[t_idx])
+    return score
+
+
+def spatial_olsen_score(
+    x: np.ndarray,
+    signal_joints: Sequence[int],
+    sigma_j: np.ndarray,
+    coeffs: np.ndarray,
+) -> np.ndarray:
+    """Spatial variant: single Olsen term over 4 designated "signal" joints.
+
+    Per-joint grand means (averaged over F and T) play the role of u_k in the
+    temporal case.  Only the 4 signal joints enter the label; the remaining
+    J-4 joints are nuisance (but still correlated with signal via Sigma_joints,
+    so they can leak information to imperfect imputers).
+
+    Parameters
+    ----------
+    x : (N, J, F, T)
+    signal_joints : tuple of 4 joint indices in [0, J).
+    sigma_j : (J,) per-joint standard deviations for standardisation.
+    coeffs  : (3,) = [c1, c2, c3] for the single Olsen term.
+
+    Returns
+    -------
+    score : (N,) float64
+    """
+    if len(signal_joints) != 4:
+        raise ValueError("spatial_olsen_score requires exactly 4 signal joints.")
+    w = x.mean(axis=(2, 3))                                    # (N, J)
+    u = _ndtr(w / (sigma_j[np.newaxis] + 1e-12))               # (N, J)
+    coeffs = np.asarray(coeffs, dtype=np.float64).reshape(-1)
+    return _olsen_term(u, tuple(signal_joints), tuple(coeffs[:3]))
 
 
 # ---------------------------------------------------------------------------
@@ -194,20 +318,30 @@ def nonlinear_olsen_score(
 # ---------------------------------------------------------------------------
 
 class GaussianMotionBenchmark:
-    """Synthetic Gaussian temporal motion benchmark.
+    """Synthetic Gaussian motion benchmark.
 
     Parameters
     ----------
     J, F, T : int
         Joints (17), features per joint (3), frames per sequence (81).
     rho : float
-        Off-diagonal equicorrelation between joints.  Controls how much
-        knowing joint j helps predict joint j'.
+        Off-diagonal equicorrelation between joints.
     alpha : float
-        AR(1) temporal autocorrelation.  Controls how much past frames
-        predict future frames.
+        AR(1) temporal autocorrelation.
     K : int
-        Number of temporal windows (players for SHAP). Must be 4.
+        Number of temporal windows (only used when player_mode == "temporal").
+        Must be a multiple of 4 so the Olsen-style label tiles cleanly; larger
+        K means smaller windows and more SHAP players (2^K coalitions).
+    player_mode : {"temporal", "spatial"}
+        * "temporal": SHAP players are K temporal windows.  Label function is
+          the generalised Olsen score.  Ground-truth Shapley is exact by
+          enumeration of 2^K coalitions.
+        * "spatial":  SHAP players are J joints.  Label function is a single
+          Olsen term over 4 signal joints.  Ground-truth Shapley is estimated
+          with KernelSHAP using the exact joint-conditional Gaussian as
+          imputer (2^J is too large to enumerate).
+    signal_joints : tuple of 4 joint indices, optional
+        Only used when player_mode == "spatial".  Defaults to (0, 1, 2, 3).
     """
 
     def __init__(
@@ -218,16 +352,41 @@ class GaussianMotionBenchmark:
         rho: float = 0.5,
         alpha: float = 0.8,
         K: int = 4,
+        player_mode: PlayerMode = "temporal",
+        signal_joints: Sequence[int] | None = None,
     ):
-        assert K == 4, "Only K=4 temporal windows supported."
+        if player_mode not in ("temporal", "spatial"):
+            raise ValueError(
+                f"player_mode must be 'temporal' or 'spatial'; got {player_mode!r}"
+            )
+        if K % 4 != 0 or K <= 0:
+            raise ValueError(
+                f"K must be a positive multiple of 4; got {K}"
+            )
+        if player_mode == "temporal" and K > 12:
+            raise ValueError(
+                f"K={K} would enumerate 2^{K} coalitions; refuse for tractability."
+            )
+        if player_mode == "spatial":
+            if signal_joints is None:
+                signal_joints = (0, 1, 2, 3)
+            signal_joints = tuple(int(j) for j in signal_joints)
+            if len(signal_joints) != 4 or len(set(signal_joints)) != 4:
+                raise ValueError("signal_joints must be 4 distinct indices.")
+            if not all(0 <= j < J for j in signal_joints):
+                raise ValueError(f"signal_joints out of range [0, {J}).")
+
         self.J = J
         self.F = F
         self.T = T
         self.rho = rho
         self.alpha = alpha
         self.K = K
+        self.player_mode: PlayerMode = player_mode
+        self.signal_joints: tuple[int, ...] | None = (
+            tuple(signal_joints) if player_mode == "spatial" else None
+        )
 
-        # Build parametric covariance matrices.
         self.Sigma_joints = _equicorr(J, rho)      # (J, J)
         self.Sigma_time   = _ar1_cov(T, alpha)      # (T, T)
         self.L_joints     = np.linalg.cholesky(
@@ -237,19 +396,22 @@ class GaussianMotionBenchmark:
             self.Sigma_time + 1e-8 * np.eye(T)
         )  # (T, T)
 
-        # Window frame assignments (equal quarters).
         quarter = T // K
         self.window_assignments: list[list[int]] = [
             list(range(k * quarter, (k + 1) * quarter if k < K - 1 else T))
             for k in range(K)
         ]
 
-        # Precompute Cholesky + mean-weight matrices for all 14 non-trivial coalitions.
+        # Conditional-covariance caches.  Temporal entries use keys
+        # ("temporal", s_obs_windows, s_hid_windows); spatial entries use keys
+        # ("spatial",  s_obs_joints,  s_hid_joints).
         self._cond_cache: dict[tuple, tuple] = {}
-        self._precompute_conditionals()
+        if player_mode == "temporal":
+            self._precompute_conditionals()
+        # For spatial mode we build the cache lazily — 2^J is too large to
+        # enumerate so we only materialise the coalitions KernelSHAP samples.
 
         # Label function config (set by setup_label_fn; None until then).
-        # Stored in the pickle so train/val/test always use identical labelling.
         self.label_config: dict | None = None
 
     # ------------------------------------------------------------------
@@ -264,43 +426,47 @@ class GaussianMotionBenchmark:
     ) -> None:
         """Fit and store the canonical nonlinear label function.
 
-        Draws a calibration sample to estimate per-window standard deviations
-        (σ_k) and samples the three response coefficients (c1, c2, c3).  The
-        result is saved in ``self.label_config`` and persisted with the pickle.
-
-        Call this once when creating the benchmark; all subsequent calls to
-        ``canonical_label_fn`` and ``build_pytorch_dataset`` will use the
-        stored config so that train / val / test splits see identical labels.
-
-        Parameters
-        ----------
-        n_calib : int
-            Number of calibration sequences used to estimate σ_k.
-        seed : int
-            RNG seed for coefficient sampling and calibration data.
-        noise_std : float
-            Gaussian noise added to the score before quantile-binning
-            (0 = deterministic labels, consistent with the paper's default).
+        For temporal mode: one Olsen term per group of 4 windows (so
+        ``n_terms = K // 4``), each with its own freshly-sampled (c1, c2, c3).
+        For spatial mode: a single Olsen term over the 4 signal joints.
         """
         rng = np.random.default_rng(seed)
-
-        # Calibration sample to estimate per-window std σ_k.
         x_cal = self.sample(n_calib, seed=int(rng.integers(2**30)))
-        w_cal = _per_window_grand_means(x_cal, self.window_assignments)  # (n_calib, K)
-        sigma_k = w_cal.std(axis=0).clip(min=1e-8)  # (K,)
 
-        # Coefficients following the paper's spirit: c1 in [0.5, 2], c2 in [0.5, 2],
-        # c3 in [0.5, 1.0] (kept small so exp(c3·u·v) ≤ e ≈ 2.7 stays bounded).
-        c1 = float(rng.uniform(0.5, 2.0))
-        c2 = float(rng.uniform(0.5, 2.0))
-        c3 = float(rng.uniform(0.5, 1.0))
+        def _sample_term_coeffs() -> list[float]:
+            # c1, c2 in [0.5, 2.0]; c3 in [0.5, 1.0] so exp(c3·u·v) stays bounded.
+            return [
+                float(rng.uniform(0.5, 2.0)),
+                float(rng.uniform(0.5, 2.0)),
+                float(rng.uniform(0.5, 1.0)),
+            ]
 
-        self.label_config = {
-            "sigma_k":   sigma_k,
-            "coeffs":    np.array([c1, c2, c3]),
-            "noise_std": noise_std,
-            "seed":      seed,
-        }
+        if self.player_mode == "temporal":
+            w_cal = _per_window_grand_means(x_cal, self.window_assignments)  # (n_calib, K)
+            sigma_features = w_cal.std(axis=0).clip(min=1e-8)                # (K,)
+            n_terms = self.K // 4
+            coeffs = np.array([_sample_term_coeffs() for _ in range(n_terms)])  # (n_terms, 3)
+            self.label_config = {
+                "mode":             "temporal",
+                "sigma_features":   sigma_features,
+                "coeffs":           coeffs,
+                "noise_std":        noise_std,
+                "seed":             seed,
+                "n_terms":          n_terms,
+            }
+        else:                                                                 # spatial
+            w_cal = x_cal.mean(axis=(2, 3))                                   # (n_calib, J)
+            sigma_features = w_cal.std(axis=0).clip(min=1e-8)                 # (J,)
+            coeffs = np.array([_sample_term_coeffs()])                        # (1, 3)
+            self.label_config = {
+                "mode":             "spatial",
+                "sigma_features":   sigma_features,
+                "coeffs":           coeffs,
+                "noise_std":        noise_std,
+                "seed":             seed,
+                "n_terms":          1,
+                "signal_joints":    self.signal_joints,
+            }
 
     def canonical_label_fn(
         self,
@@ -310,19 +476,24 @@ class GaussianMotionBenchmark:
         """Apply the stored nonlinear label function to sequences x (N, J, F, T).
 
         Raises ``RuntimeError`` if ``setup_label_fn`` has not been called.
-
-        Returns
-        -------
-        y : (N,) int64 in {0, 1, 2} (quantile-binned score).
         """
         if self.label_config is None:
             raise RuntimeError(
                 "Call bench.setup_label_fn() before using canonical_label_fn."
             )
         cfg = self.label_config
-        score = nonlinear_olsen_score(
-            x, self.window_assignments, cfg["sigma_k"], cfg["coeffs"],
-        )
+        mode = cfg.get("mode", "temporal")
+        # Back-compat: old pickles stored "sigma_k" and a flat (3,) coeff vector.
+        sigma_features = cfg.get("sigma_features", cfg.get("sigma_k"))
+        coeffs = np.asarray(cfg["coeffs"], dtype=np.float64)
+        if mode == "temporal":
+            score = nonlinear_olsen_score(
+                x, self.window_assignments, sigma_features, coeffs,
+            )
+        else:
+            score = spatial_olsen_score(
+                x, cfg["signal_joints"], sigma_features, coeffs.reshape(-1),
+            )
         if cfg["noise_std"] > 0:
             _rng = rng if rng is not None else np.random.default_rng(cfg["seed"] + 1)
             score = score + _rng.normal(0, cfg["noise_std"], size=len(score))
@@ -337,7 +508,7 @@ class GaussianMotionBenchmark:
         return np.concatenate([self.window_assignments[k] for k in window_indices])
 
     def _precompute_conditionals(self) -> None:
-        """Cache (L_cond_time, W_mean) for each unique (S_obs_tuple, S_hid_tuple)."""
+        """Temporal mode: cache (L_cond_time, W_mean) for all non-trivial coalitions."""
         K = self.K
         coalitions, _ = _enumerate_temporal_coalitions(K)
         seen: set[tuple] = set()
@@ -345,8 +516,8 @@ class GaussianMotionBenchmark:
             s_obs = tuple(k for k in range(K) if z[k] == 1)
             s_hid = tuple(k for k in range(K) if z[k] == 0)
             if not s_obs or not s_hid:
-                continue  # skip empty or full coalition
-            key = (s_obs, s_hid)
+                continue
+            key = ("temporal", s_obs, s_hid)
             if key in seen:
                 continue
             seen.add(key)
@@ -434,7 +605,7 @@ class GaussianMotionBenchmark:
         t_hid = self._window_frames(list(s_hid))
         n_hid = len(t_hid)
 
-        key = (s_obs, s_hid)
+        key = ("temporal", s_obs, s_hid)
         if key not in self._cond_cache:
             self._cond_cache[key] = self._compute_cond_params(s_obs, s_hid)
         L_cond, W_mean = self._cond_cache[key]
@@ -453,6 +624,102 @@ class GaussianMotionBenchmark:
         # Completed sequences.
         out = np.tile(x[None], (n_samples, 1, 1, 1)).astype(np.float64)  # (n_samples, J, F, T)
         out[:, :, :, t_hid] = mu[None] + noise_t
+        return out.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Spatial conditional sampling (joints as players)
+    # ------------------------------------------------------------------
+
+    def _compute_cond_params_spatial(
+        self,
+        j_obs: tuple[int, ...],
+        j_hid: tuple[int, ...],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Joint-conditional Gaussian parameters.
+
+        Under ``x ~ N(0, Sigma_joints ⊗ I_F ⊗ Sigma_time)`` the joint-marginal
+        covariance is ``Sigma_joints`` (for any fixed f, t), so conditioning
+        x_{j_hid} | x_{j_obs} is a standard multivariate Gaussian conditional::
+
+            W             = Sigma_joints[hid, obs] @ inv(Sigma_joints[obs, obs])
+            Sigma_hid_cond = Sigma_joints[hid, hid] - W @ Sigma_joints[obs, hid]
+
+        Because the Kronecker structure is ``I_F ⊗ Sigma_time`` across (f, t),
+        the same W and Sigma_hid_cond apply independently to every (f, t).
+
+        Returns
+        -------
+        L_cond_j : (n_hid, n_hid) Cholesky factor of Sigma_hid_cond
+        W        : (n_hid, n_obs) conditional-mean weight matrix
+        """
+        j_obs_a = np.asarray(j_obs, dtype=int)
+        j_hid_a = np.asarray(j_hid, dtype=int)
+        Soo = self.Sigma_joints[np.ix_(j_obs_a, j_obs_a)]
+        Shh = self.Sigma_joints[np.ix_(j_hid_a, j_hid_a)]
+        Sho = self.Sigma_joints[np.ix_(j_hid_a, j_obs_a)]
+        W = Sho @ np.linalg.solve(
+            Soo + 1e-10 * np.eye(len(j_obs_a)),
+            np.eye(len(j_obs_a)),
+        )
+        Sigma_cond = Shh - W @ Sho.T
+        Sigma_cond = (Sigma_cond + Sigma_cond.T) / 2.0
+        Sigma_cond += 1e-8 * np.eye(len(j_hid_a))
+        L_cond = np.linalg.cholesky(Sigma_cond)
+        return L_cond, W
+
+    def conditional_sample_spatial(
+        self,
+        x: np.ndarray,
+        j_obs: tuple[int, ...],
+        j_hid: tuple[int, ...],
+        n_samples: int,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Draw n_samples from p(x_{j_hid} | x_{j_obs}) exactly.
+
+        Parameters
+        ----------
+        x : (J, F, T) array of the conditioning sequence.
+        j_obs, j_hid : tuples of joint indices (disjoint, non-empty).
+        n_samples : int
+        rng : numpy Generator
+
+        Returns
+        -------
+        x_completed : (n_samples, J, F, T) array with x[j_obs, :, :] copied
+                      from the input and x[j_hid, :, :] drawn from the
+                      exact joint-conditional.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        J, F, T = self.J, self.F, self.T
+        j_obs = tuple(int(j) for j in j_obs)
+        j_hid = tuple(int(j) for j in j_hid)
+        n_hid = len(j_hid)
+        n_obs = len(j_obs)
+        if n_hid == 0 or n_obs == 0:
+            raise ValueError("j_obs and j_hid must both be non-empty.")
+
+        key = ("spatial", j_obs, j_hid)
+        if key not in self._cond_cache:
+            self._cond_cache[key] = self._compute_cond_params_spatial(j_obs, j_hid)
+        L_cond_j, W = self._cond_cache[key]
+
+        j_obs_a = np.asarray(j_obs, dtype=int)
+        j_hid_a = np.asarray(j_hid, dtype=int)
+
+        # Conditional mean: (n_hid, F, T) = W_{hid,obs} @ x[obs, :, :]
+        mu = np.einsum("ho,oft->hft", W, x[j_obs_a, :, :])       # (n_hid, F, T)
+
+        # Noise with Kronecker covariance Sigma_hid_cond ⊗ I_F ⊗ Sigma_time.
+        noise = rng.standard_normal((n_samples, n_hid, F, T)).astype(np.float64)
+        # Temporal Cholesky over t (per n, hid, f).
+        noise = np.einsum("tT,nhfT->nhft", self.L_time, noise)
+        # Joint-conditional Cholesky over hidden-joint axis (per n, f, t).
+        noise = np.einsum("hH,nHft->nhft", L_cond_j, noise)
+
+        out = np.tile(x[None], (n_samples, 1, 1, 1)).astype(np.float64)
+        out[:, j_hid_a, :, :] = mu[None] + noise
         return out.astype(np.float32)
 
     # ------------------------------------------------------------------
@@ -537,6 +804,114 @@ class GaussianMotionBenchmark:
         )
 
     # ------------------------------------------------------------------
+    # Spatial ground-truth Shapley via KernelSHAP sampling
+    # ------------------------------------------------------------------
+
+    def sample_spatial_coalitions(
+        self,
+        n_pairs: int,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Draw 2*n_pairs spatial (J-dim) KernelSHAP coalitions with weights."""
+        if rng is None:
+            rng = np.random.default_rng()
+        return _sample_kernelshap_coalitions(self.J, n_pairs, rng)
+
+    def compute_v_spatial(
+        self,
+        x: torch.Tensor,
+        classifier_fn: Callable,
+        coalitions: np.ndarray,
+        K_mc: int = 500,
+        device: torch.device | None = None,
+        seed: int | None = None,
+        v_empty_samples: int | None = None,
+    ) -> np.ndarray:
+        """Evaluate the true value function v(S) = E[f(x) | x_S = x_S*] for a
+        list of spatial coalitions using the exact joint-conditional Gaussian.
+
+        Parameters
+        ----------
+        x : (1, J, F, T) torch tensor — a single test sequence.
+        classifier_fn : callable (B, J, F, T) -> (B,) scalar target.
+        coalitions : (N, J) int/bool array (1 = observed joint).
+        K_mc : MC samples per coalition for the conditional expectation.
+        v_empty_samples : MC samples for the empty coalition (draws from
+                          the unconditional marginal). Defaults to K_mc.
+
+        Returns
+        -------
+        v : (N,) float64 array.
+        """
+        if device is None:
+            device = x.device
+        if v_empty_samples is None:
+            v_empty_samples = K_mc
+        rng = np.random.default_rng(seed)
+        x_np = x[0].cpu().numpy().astype(np.float64)             # (J, F, T)
+        N = coalitions.shape[0]
+        v = np.zeros(N, dtype=np.float64)
+
+        for i in range(N):
+            z = coalitions[i].astype(bool)
+            j_obs = tuple(int(j) for j in np.nonzero(z)[0])
+            j_hid = tuple(int(j) for j in np.nonzero(~z)[0])
+            if not j_hid:
+                with torch.no_grad():
+                    v[i] = float(_eval_classifier(classifier_fn, x.to(device)).mean().item())
+            elif not j_obs:
+                x_marg = self.sample(v_empty_samples, seed=int(rng.integers(1 << 31)))
+                x_marg_t = torch.tensor(x_marg, device=device, dtype=torch.float32)
+                with torch.no_grad():
+                    v[i] = float(_eval_classifier(classifier_fn, x_marg_t).mean().item())
+            else:
+                samps = self.conditional_sample_spatial(
+                    x_np, j_obs, j_hid, n_samples=K_mc, rng=rng,
+                )
+                samps_t = torch.tensor(samps, device=device, dtype=torch.float32)
+                with torch.no_grad():
+                    v[i] = float(_eval_classifier(classifier_fn, samps_t).mean().item())
+        return v
+
+    def compute_true_shapley_spatial(
+        self,
+        x: torch.Tensor,
+        classifier_fn: Callable,
+        coalitions: np.ndarray,
+        weights: np.ndarray,
+        K_mc: int = 500,
+        device: torch.device | None = None,
+        seed: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
+        """Estimate spatial Shapley φ via KernelSHAP with oracle conditionals.
+
+        Returns
+        -------
+        phi     : (J,) oracle Shapley estimate.
+        v       : (N,) oracle contribution values on the sampled coalitions.
+        v_empty : float, E[f(x)] under the unconditional marginal.
+        v_full  : float, f(x*).
+        """
+        rng = np.random.default_rng(seed)
+        v = self.compute_v_spatial(
+            x, classifier_fn, coalitions, K_mc=K_mc,
+            device=device, seed=int(rng.integers(1 << 31)),
+        )
+        empty_c = np.zeros((1, self.J), dtype=int)
+        full_c  = np.ones((1, self.J),  dtype=int)
+        v_ef = self.compute_v_spatial(
+            x, classifier_fn, np.vstack([empty_c, full_c]), K_mc=K_mc,
+            device=device, seed=int(rng.integers(1 << 31)),
+        )
+        v_empty = float(v_ef[0])
+        v_full  = float(v_ef[1])
+        phi = _solve_shapley_wls(
+            coalitions, v, weights,
+            v_empty=v_empty, v_full=v_full,
+        )
+        return phi, v, v_empty, v_full
+
+    # ------------------------------------------------------------------
     # PyTorch dataset builder
     # ------------------------------------------------------------------
 
@@ -605,22 +980,19 @@ class GaussianMotionBenchmark:
 class SyntheticMLPClassifier(nn.Module):
     """Black-box MLP classifier for the Gaussian motion benchmark.
 
-    Architecture mirrors Olsen et al. (2022) Section 4.2: the classifier sees
-    the same K per-window grand-mean features that determine the nonlinear
-    Shapley label, making it a genuine black-box the SHAP methods must explain.
+    Two feature-extraction paths:
 
-    Feature extraction
-    ------------------
-    For each of the K temporal windows:
-        w_k = mean of x over all (joint, feature, time) in that window  → scalar
-    Input to the MLP: (w_0, w_1, w_2, w_3) — K=4 dimensional.
+    * ``player_mode='temporal'``: per-window grand means ``(B, K)``. Mirrors
+      Olsen et al. (2022): the classifier sees the same K aggregates the
+      nonlinear label depends on, making it a genuine black-box for SHAP.
 
-    Why grand means?  The nonlinear response
-        score = c1·sin(π·u0·u1) + c2·u2·exp(c3·u2·u3)
-    depends only on these K per-window aggregates.  Using higher-dimensional
-    per-(joint, feature) means would give the MLP spurious noise dimensions.
+    * ``player_mode='spatial'``: per-joint grand means ``(B, J)``. The
+      classifier sees every joint individually; the label depends on 4
+      signal joints but the classifier does not know which, so any
+      reasonable imputer must preserve joint correlations to approximate
+      v(S) well.
 
-    Architecture: K → BatchNorm → 64 → ReLU → 64 → ReLU → num_classes
+    Architecture: input_dim → BatchNorm → hidden → ReLU → hidden → ReLU → num_classes
     """
 
     def __init__(
@@ -631,14 +1003,30 @@ class SyntheticMLPClassifier(nn.Module):
         K: int = 4,
         num_classes: int = 3,
         hidden: int = 64,
+        player_mode: PlayerMode = "temporal",
     ):
         super().__init__()
-        quarter = T // K
-        self.window_starts = [k * quarter for k in range(K)]
-        self.window_ends   = [(k + 1) * quarter if k < K - 1 else T for k in range(K)]
+        if player_mode not in ("temporal", "spatial"):
+            raise ValueError(f"player_mode must be 'temporal' or 'spatial'; got {player_mode!r}")
+        self.player_mode: PlayerMode = player_mode
+        self.J = J
+        self.F = F
+        self.T = T
+        self.K = K
+
+        if player_mode == "temporal":
+            quarter = T // K
+            self.window_starts = [k * quarter for k in range(K)]
+            self.window_ends   = [(k + 1) * quarter if k < K - 1 else T for k in range(K)]
+            input_dim = K
+        else:
+            self.window_starts = None
+            self.window_ends = None
+            input_dim = J
+
         self.net = nn.Sequential(
-            nn.BatchNorm1d(K),
-            nn.Linear(K, hidden),
+            nn.BatchNorm1d(input_dim),
+            nn.Linear(input_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -646,12 +1034,14 @@ class SyntheticMLPClassifier(nn.Module):
         )
 
     def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, J, F, T) → (B, K) per-window grand means."""
-        feats = [
-            x[:, :, :, s:e].mean(dim=(1, 2, 3))  # (B,)
-            for s, e in zip(self.window_starts, self.window_ends)
-        ]
-        return torch.stack(feats, dim=1)  # (B, K)
+        """x: (B, J, F, T) → (B, K) or (B, J) grand means."""
+        if self.player_mode == "temporal":
+            feats = [
+                x[:, :, :, s:e].mean(dim=(1, 2, 3))
+                for s, e in zip(self.window_starts, self.window_ends)
+            ]
+            return torch.stack(feats, dim=1)                     # (B, K)
+        return x.mean(dim=(2, 3))                                # (B, J)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(self._extract_features(x))
@@ -748,6 +1138,8 @@ def build_gaussian_benchmark_and_classifier(
     clf_epochs: int = 80,
     seed: int = 0,
     device: torch.device | None = None,
+    player_mode: PlayerMode = "temporal",
+    signal_joints: Sequence[int] | None = None,
 ) -> tuple[
     "GaussianMotionBenchmark",
     "SyntheticMLPClassifier",
@@ -755,13 +1147,11 @@ def build_gaussian_benchmark_and_classifier(
     TensorDataset,
     TensorDataset,
 ]:
-    """Convenience factory: build benchmark, sample splits, train classifier.
-
-    Returns
-    -------
-    bench, classifier, train_ds, val_ds, test_ds
-    """
-    bench = GaussianMotionBenchmark(J=J, F=F, T=T, rho=rho, alpha=alpha, K=K)
+    """Convenience factory: build benchmark, sample splits, train classifier."""
+    bench = GaussianMotionBenchmark(
+        J=J, F=F, T=T, rho=rho, alpha=alpha, K=K,
+        player_mode=player_mode, signal_joints=signal_joints,
+    )
     bench.setup_label_fn(n_calib=5000, seed=seed + 99)
 
     x_tr = bench.sample(n_train, seed=seed)
@@ -772,9 +1162,8 @@ def build_gaussian_benchmark_and_classifier(
     y_va = bench.canonical_label_fn(x_va)
     y_te = bench.canonical_label_fn(x_te)
 
-    # Build datasets in ACTOR (T-first) format.
     def _make_ds(x_arr, y_arr):
-        xt = torch.tensor(x_arr).permute(0, 3, 1, 2).contiguous()  # (N, T, J, F)
+        xt = torch.tensor(x_arr).permute(0, 3, 1, 2).contiguous()
         yt = torch.tensor(y_arr, dtype=torch.long)
         pm = torch.ones(len(x_arr), T, dtype=torch.bool)
         return TensorDataset(xt, yt, pm)
@@ -783,8 +1172,9 @@ def build_gaussian_benchmark_and_classifier(
     val_ds   = _make_ds(x_va, y_va)
     test_ds  = _make_ds(x_te, y_te)
 
-    # Train classifier — use majority class as the target class for SHAP.
-    clf = SyntheticMLPClassifier(J=J, F=F, T=T, K=K, num_classes=3)
+    clf = SyntheticMLPClassifier(
+        J=J, F=F, T=T, K=K, num_classes=3, player_mode=player_mode,
+    )
     clf.fit(x_tr, y_tr, epochs=clf_epochs, device=device, seed=seed)
 
     return bench, clf, train_ds, val_ds, test_ds
@@ -795,38 +1185,62 @@ def build_gaussian_benchmark_and_classifier(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # ---- Temporal K=4 smoke test -------------------------------------------
     bench = GaussianMotionBenchmark(J=5, F=1, T=16, rho=0.5, alpha=0.8, K=4)
     x = bench.sample(10, seed=0)
     assert x.shape == (10, 5, 1, 16), x.shape
 
-    x0 = x[0]  # (J, F, T)
-    samps = bench.conditional_sample(x0, s_obs=(0, 2), s_hid=(1, 3), n_samples=1000)
+    x0 = x[0]
+    samps = bench.conditional_sample(x0, s_obs=(0, 2), s_hid=(1, 3), n_samples=100)
     assert samps.shape == (100, 5, 1, 16), samps.shape
-    # Observed windows should be unchanged.
     for k in [0, 2]:
         for t in bench.window_assignments[k]:
             assert np.allclose(samps[:, :, :, t], x0[:, :, t][None]), f"window {k} frame {t} changed"
-    print("conditional_sample OK")
+    print("temporal K=4 conditional_sample OK")
 
     clf = SyntheticMLPClassifier(J=5, F=1, T=16, K=4, num_classes=3)
     x_np = bench.sample(200, seed=1)
-    y_np = (x_np[:, 0, 0, :].mean(-1) > 0).astype(np.int64)  # dummy labels
-    # map to 3 classes
-    y_np = np.where(y_np == 0, 0, np.where(x_np[:, 1, 0, :].mean(-1) > 0, 1, 2))
+    y_np = np.where(x_np[:, 0, 0, :].mean(-1) < 0, 0,
+                    np.where(x_np[:, 1, 0, :].mean(-1) > 0, 2, 1)).astype(np.int64)
     clf.fit(x_np, y_np, epochs=5)
-    print("SyntheticMLPClassifier.fit OK")
+    print("temporal SyntheticMLPClassifier.fit OK")
 
-    x_t = torch.tensor(x[:1])  # (1, 5, 1, 16)
+    x_t = torch.tensor(x[:1])
     prob_fn = clf.class_prob_fn(0)
     with torch.no_grad():
-        p = prob_fn(x_t)
-    assert p.shape == (1,), p.shape
-    print("class_prob_fn OK")
-
-    # True v(S).
+        assert prob_fn(x_t).shape == (1,)
     v_all = bench.compute_v_true_all_coalitions(x_t, prob_fn, K_mc=50, seed=7)
-    assert len(v_all) == 2 ** 4  # 16
+    assert len(v_all) == 2 ** 4
     phi = bench.compute_true_shapley(v_all)
     assert phi.shape == (4,)
-    print(f"True Shapley values: {phi}")
+    print(f"temporal K=4 true φ = {phi}")
+
+    # ---- Temporal K=8 smoke test -------------------------------------------
+    bench8 = GaussianMotionBenchmark(J=5, F=1, T=32, rho=0.5, alpha=0.8, K=8)
+    bench8.setup_label_fn(n_calib=500, seed=0)
+    x8 = bench8.sample(5, seed=0)
+    y8 = bench8.canonical_label_fn(x8)
+    assert y8.shape == (5,) and y8.dtype == np.int64
+    # label_config should hold 2 Olsen terms (K=8 → K//4 = 2).
+    assert bench8.label_config["n_terms"] == 2
+    print("temporal K=8 label + n_terms OK")
+
+    # ---- Spatial smoke test ------------------------------------------------
+    benchS = GaussianMotionBenchmark(
+        J=5, F=1, T=16, rho=0.5, alpha=0.8, K=4,
+        player_mode="spatial", signal_joints=(0, 1, 2, 3),
+    )
+    benchS.setup_label_fn(n_calib=500, seed=0)
+    xS = benchS.sample(5, seed=0)
+    yS = benchS.canonical_label_fn(xS)
+    assert yS.shape == (5,)
+    # Conditional sample over joints.
+    xS0 = xS[0]
+    j_obs = (0, 2, 4)
+    j_hid = (1, 3)
+    samps_j = benchS.conditional_sample_spatial(xS0, j_obs, j_hid, n_samples=20)
+    assert samps_j.shape == (20, 5, 1, 16)
+    for j in j_obs:
+        assert np.allclose(samps_j[:, j], xS0[j][None]), f"observed joint {j} changed"
+    print("spatial conditional_sample_spatial OK")
     print("Smoke test PASSED")

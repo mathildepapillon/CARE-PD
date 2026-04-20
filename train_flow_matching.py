@@ -241,6 +241,7 @@ class FlowMatchingLit(pl.LightningModule):
             dropout=float(cfg["dropout"]),
             time_emb_dim=int(cfg["time_emb_dim"]),
             max_len=max(int(cfg["seq_len"]) + 16, 256),
+            tokenization=str(cfg.get("tokenization", "frame")),
         )
         self.path = AffineProbPath(scheduler=CondOTScheduler())
         self.ema: EMA | None = None  # created lazily in on_fit_start
@@ -397,6 +398,7 @@ def run_smoke(cfg: dict[str, Any]) -> None:
         num_layers=int(cfg["num_layers"]), ff_dim=int(cfg["ff_dim"]),
         dropout=0.0, time_emb_dim=int(cfg["time_emb_dim"]),
         max_len=int(cfg["seq_len"]) + 16,
+        tokenization=str(cfg.get("tokenization", "frame")),
     ).to(device)
     B, T = 2, int(cfg["seq_len"])
     x = torch.randn(B, T, 17, 3, device=device)
