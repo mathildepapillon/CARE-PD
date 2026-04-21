@@ -64,6 +64,12 @@ from synthetic.gaussian_motion import (  # noqa: E402
     _solve_shapley_wls,
 )
 
+try:
+    from synthetic.burr_tabular import BurrTabularBenchmark, BurrRFWrapper  # noqa: F401
+except ImportError:
+    BurrTabularBenchmark = None  # type: ignore[assignment,misc]
+    BurrRFWrapper = None         # type: ignore[assignment,misc]
+
 
 # ---------------------------------------------------------------------------
 # Flow-matching imputer loader
@@ -689,29 +695,46 @@ def main() -> None:
     print(f"[eval] ckpt_dir={ckpt_dir}", flush=True)
 
     with open(ckpt_dir / "synthetic_benchmark.pkl", "rb") as f:
-        bench: GaussianMotionBenchmark = pickle.load(f)
+        bench = pickle.load(f)
     # Back-compat: older pickles have no player_mode attribute.
     if not hasattr(bench, "player_mode"):
         bench.player_mode = "temporal"
         bench.signal_joints = None
-    print(f"[eval] benchmark: J={bench.J}, F={bench.F}, T={bench.T}, K={bench.K}, "
-          f"rho={bench.rho}, alpha={bench.alpha}, player_mode={bench.player_mode}",
-          flush=True)
+
+    is_burr = (BurrTabularBenchmark is not None and isinstance(bench, BurrTabularBenchmark))
+
+    if is_burr:
+        print(f"[eval] benchmark: BurrTabular  M={bench.M}  κ={bench.kappa}  "
+              f"player_mode={bench.player_mode}", flush=True)
+    else:
+        print(f"[eval] benchmark: J={bench.J}, F={bench.F}, T={bench.T}, K={bench.K}, "
+              f"rho={bench.rho}, alpha={bench.alpha}, player_mode={bench.player_mode}",
+              flush=True)
 
     with open(ckpt_dir / "synthetic_clf_meta.json") as f:
         clf_meta = json.load(f)
     clf_pm = clf_meta.get("player_mode", "temporal")
-    if clf_pm != bench.player_mode:
-        raise RuntimeError(
-            f"classifier player_mode={clf_pm!r} but benchmark is {bench.player_mode!r}"
+
+    if clf_meta.get("type") == "BurrRFWrapper":
+        import pickle as _pkl
+        with open(ckpt_dir / "synthetic_clf.pkl", "rb") as _f:
+            clf = _pkl.load(_f)
+        clf.to = lambda *a, **kw: clf        # stub so code below doesn't break
+        clf.eval = lambda: clf
+        is_regression = True
+    else:
+        if clf_pm != bench.player_mode:
+            raise RuntimeError(
+                f"classifier player_mode={clf_pm!r} but benchmark is {bench.player_mode!r}"
+            )
+        clf = SyntheticMLPClassifier(
+            J=clf_meta["J"], F=clf_meta["F"], T=clf_meta["T"],
+            K=clf_meta.get("K", 4), num_classes=clf_meta["num_classes"],
+            player_mode=clf_pm,
         )
-    clf = SyntheticMLPClassifier(
-        J=clf_meta["J"], F=clf_meta["F"], T=clf_meta["T"],
-        K=clf_meta.get("K", 4), num_classes=clf_meta["num_classes"],
-        player_mode=clf_pm,
-    )
-    clf.load_state_dict(torch.load(ckpt_dir / "synthetic_clf.pt", map_location="cpu"))
-    clf.to(device).eval()
+        clf.load_state_dict(torch.load(ckpt_dir / "synthetic_clf.pt", map_location="cpu"))
+        clf.to(device).eval()
+        is_regression = False
 
     test_data = torch.load(ckpt_dir / "synthetic_test.pt", map_location="cpu")
     x_test_tjf = test_data["x"]                                             # (N, T, J, F)
@@ -722,30 +745,54 @@ def main() -> None:
     y_test     = y_test[:N_test]
     print(f"[eval] evaluating {N_test} test sequences", flush=True)
 
-    # Classifier test accuracy for context.
+    # Classifier test accuracy / R² for context.
     with torch.no_grad():
-        preds = clf(x_test_jft.to(device)).argmax(dim=-1).cpu()
-    acc = (preds == y_test).float().mean().item()
-    print(f"[eval] classifier test accuracy: {acc:.1%}", flush=True)
+        if is_regression:
+            preds_np = clf.predict_np(x_test_jft.numpy())
+            from sklearn.metrics import r2_score as _r2
+            r2 = _r2(y_test.numpy(), preds_np)
+            print(f"[eval] RF test R²={r2:.4f}", flush=True)
+        else:
+            preds = clf(x_test_jft.to(device)).argmax(dim=-1).cpu()
+            acc = (preds == y_test).float().mean().item()
+            print(f"[eval] classifier test accuracy: {acc:.1%}", flush=True)
 
     x_train_jft = np.load(ckpt_dir / "x_train_jft.npy")
     train_pool = torch.from_numpy(x_train_jft).float()
     train_mean = torch.from_numpy(x_train_jft.mean(axis=0)).float()
     zero_fill  = torch.zeros_like(train_mean)
 
-    if args.class_idx is None:
+    if is_regression:
+        class_idx = 0   # ignored for regression; kept for interface parity
+        print("[eval] SHAP target: regression output (RF predictor)", flush=True)
+        prob_fn = clf.class_prob_fn(0)
+    elif args.class_idx is None:
         class_idx = int(np.bincount(y_test.numpy()).argmax())
+        print(f"[eval] SHAP target class: {class_idx}", flush=True)
+        prob_fn = clf.class_prob_fn(class_idx)
     else:
         class_idx = int(args.class_idx)
-    print(f"[eval] SHAP target class: {class_idx}", flush=True)
-    prob_fn = clf.class_prob_fn(class_idx)
+        print(f"[eval] SHAP target class: {class_idx}", flush=True)
+        prob_fn = clf.class_prob_fn(class_idx)
 
     # ---- Coalitions ---------------------------------------------------------
     if bench.player_mode == "temporal":
-        coalitions, weights = _enumerate_temporal_coalitions(bench.K)
+        if bench.K <= 20:
+            coalitions, weights = _enumerate_temporal_coalitions(bench.K)
+            kshap_label = f"enumerate 2^{bench.K}={2**bench.K}"
+        else:
+            # High-dim Burr: KernelSHAP paired sampling (NS=1000, paper setting).
+            coalitions, weights = _sample_kernelshap_coalitions(
+                bench.K, 500, np.random.default_rng(args.seed + 1),
+            )
+            empty_row = np.zeros((1, bench.K), dtype=int)
+            full_row  = np.ones((1, bench.K),  dtype=int)
+            coalitions = np.vstack([empty_row, coalitions, full_row])
+            boundary_w = 1e6
+            weights = np.concatenate([[boundary_w], weights, [boundary_w]])
+            kshap_label = f"KernelSHAP paired sampling (N={len(coalitions)})"
         player_count = bench.K
         truth_key = "gaussian_oracle"
-        kshap_label = f"enumerate 2^{bench.K}={2**bench.K}"
     else:
         coalitions, weights = _sample_kernelshap_coalitions(
             bench.J, args.n_kernel_samples, np.random.default_rng(args.seed + 1),

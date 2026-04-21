@@ -124,6 +124,13 @@ def _load_gaussian_classifier(ckpt_dir: Path, device: torch.device) -> nn.Module
     return clf
 
 
+def _load_burr_classifier(ckpt_dir: Path) -> Any:
+    """Load a BurrRFWrapper (pickle) from ckpt_dir."""
+    import pickle
+    with open(ckpt_dir / "synthetic_clf.pkl", "rb") as f:
+        return pickle.load(f)
+
+
 # ---------------------------------------------------------------------------
 # Classifier adapters: bridge (B, T, J, C) flow-space ↔ classifier input
 # ---------------------------------------------------------------------------
@@ -147,6 +154,16 @@ def _make_classifier_fn(
             if cls.ndim == 0:
                 cls = cls.expand(x_flow.shape[0])
             return probs.gather(1, cls.view(-1, 1)).squeeze(-1)
+        return classifier_fn
+
+    if data_mode == "synthetic_burr":
+        # clf is a BurrRFWrapper; returns continuous regression predictions.
+        def classifier_fn(x_flow: torch.Tensor, ctx: Dict[str, Any]) -> torch.Tensor:  # noqa: F811
+            # x_flow: (B, T, J, F) → permute to (B, J, F, T) then mean over J, F
+            x_bjft = x_flow.permute(0, 2, 3, 1).cpu().numpy()  # (B, J, F, T)
+            feats = x_bjft.mean(axis=(1, 2))                    # (B, T=M)
+            preds = clf.rf.predict(feats).astype(np.float32)
+            return torch.tensor(preds, device=x_flow.device)
         return classifier_fn
 
     raise ValueError(f"Unknown data_mode: {data_mode!r}")
@@ -176,16 +193,18 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt_dir", required=True,
-                   help="Directory produced by scripts/build_synthetic_gaussian_data.py.")
+                   help="Directory produced by scripts/build_synthetic_gaussian_data.py "
+                        "or scripts/build_synthetic_burr_data.py.")
     p.add_argument("--flow_ckpt_dir", required=True,
                    help="Directory produced by train_flow_matching.py "
                         "(must contain last.ckpt or flow_matching_*_best.ckpt).")
     p.add_argument("--flow_config", required=True,
                    help="Path to the flow-matching JSON config used to train "
                         "the checkpoint in --flow_ckpt_dir.")
-    p.add_argument("--data_mode", choices=("synthetic_gaussian",),
+    p.add_argument("--data_mode", choices=("synthetic_gaussian", "synthetic_burr"),
                    default="synthetic_gaussian",
-                   help="Synthetic benchmark. Only 'synthetic_gaussian' is supported.")
+                   help="Synthetic benchmark: 'synthetic_gaussian' (Gaussian motion, "
+                        "MLP classifier) or 'synthetic_burr' (Burr tabular, RF regressor).")
     p.add_argument("--n_clips", type=int, default=100,
                    help="Cap on test clips to attribute (0 = all).")
     p.add_argument("--batch_size", type=int, default=16)
@@ -229,9 +248,13 @@ def main() -> None:
     velocity_net = _load_velocity_net(flow_cfg, ckpt_path, device)
 
     print(f"[ig_synth] classifier   ← {ckpt_dir} (mode={data_mode})")
-    clf = _load_gaussian_classifier(ckpt_dir, device)
-    num_classes = int(getattr(clf, "net", nn.Identity())[-1].out_features) \
-                  if hasattr(clf, "net") else 3
+    if data_mode == "synthetic_burr":
+        clf = _load_burr_classifier(ckpt_dir)
+        num_classes = 1
+    else:
+        clf = _load_gaussian_classifier(ckpt_dir, device)
+        num_classes = int(getattr(clf, "net", nn.Identity())[-1].out_features) \
+                      if hasattr(clf, "net") else 3
     classifier_fn = _make_classifier_fn(clf, data_mode, num_classes)
 
     # --- load test clips ----------------------------------------------------
